@@ -9,6 +9,10 @@
 #include "src/solver.h"
 #include "src/data.h"
 
+// Implemented in kernels/*.cu
+void launch_kernel(const half* A, const half* B, float* C,
+                   const GemmConfig& cfg, cudaStream_t stream);
+
 // ── Command-line parsing ──────────────────────────────────────────────────────
 struct Args {
     int M = 8192, N = 8192, K = 8192;
@@ -43,6 +47,49 @@ static int query_num_gpus() {
     return n;
 }
 
+// ── Out-of-core shard generation (no global host A/B materialization) ───────
+// Deterministic value generator from global indices so shards are reproducible
+// without allocating full matrices in host RAM.
+static inline half gen_fp16_val(int batch, int r, int c, int ld) {
+    unsigned x = (unsigned)(batch * 1315423911u) ^ (unsigned)(r * 2654435761u)
+               ^ (unsigned)(c * 40503u) ^ (unsigned)(ld * 2166136261u);
+    x ^= x >> 13;
+    x *= 1274126177u;
+    x ^= x >> 16;
+    float v = ((x & 0xFFFFu) / 65535.0f) * 0.1f - 0.05f;
+    return __float2half(v);
+}
+
+static void fill_rank_batch_shards(
+    half* A_shard,
+    half* B_shard,
+    int M, int N, int K,
+    int local_M, int local_N, int local_K,
+    int batch,
+    RankCoord coord)
+{
+    const int A_row_offset = coord.row * local_M;
+    const int A_col_offset = coord.col * local_K;
+    const int B_row_offset = coord.col * local_K;
+    const int B_col_offset = coord.col * local_N;
+
+    for (int m = 0; m < local_M; ++m) {
+        int gr = A_row_offset + m;
+        for (int k = 0; k < local_K; ++k) {
+            int gc = A_col_offset + k;
+            A_shard[(size_t)m * local_K + k] = gen_fp16_val(batch, gr, gc, K);
+        }
+    }
+
+    for (int k = 0; k < local_K; ++k) {
+        int gr = B_row_offset + k;
+        for (int n = 0; n < local_N; ++n) {
+            int gc = B_col_offset + n;
+            B_shard[(size_t)k * local_N + n] = gen_fp16_val(batch, gr, gc, N);
+        }
+    }
+}
+
 // ── Verification: single GPU (1x1 mesh), confirms kernel correctness ──────────
 static void run_verify() {
     constexpr int Mv = 512, Nv = 512, Kv = 512;
@@ -60,8 +107,16 @@ static void run_verify() {
     CHECK_CUDA(cudaMemcpy(d_B.get(), h_B.data(), Kv * Nv * sizeof(half),  cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_C.get(), 0, Mv * Nv * sizeof(float)));
 
-    GemmConfig vcfg{ .M=Mv, .N=Nv, .K=Kv, .num_batches=1, .warmups=0, .runs=1,
-                     .tp_rows=1, .tp_cols=1, .gpu_rank=0 };
+    GemmConfig vcfg{};
+    vcfg.M = Mv;
+    vcfg.N = Nv;
+    vcfg.K = Kv;
+    vcfg.num_batches = 1;
+    vcfg.warmups = 0;
+    vcfg.runs = 1;
+    vcfg.tp_rows = 1;
+    vcfg.tp_cols = 1;
+    vcfg.gpu_rank = 0;
     Solver solver;
     solver.configure(vcfg);
     solver.run(d_A.get(), d_B.get(), d_C.get());
@@ -103,67 +158,128 @@ static float run_profile(const Args& args) {
                num_ranks, num_gpus);
     }
 
-    // ── Allocate & fill global host matrices ─────────────────────────────────
-    size_t szA_g = (size_t)B * M * K;
-    size_t szB_g = (size_t)B * K * N;
-    size_t szC_g = (size_t)B * M * N;
-
-    std::vector<half>  h_A(szA_g), h_B(szB_g);
-    std::vector<float> h_C_global(szC_g, 0.f);
-
-    generate_fp16(h_A.data(), h_B.data(), M, N, K, B);
-
-    // ── Per-rank shard buffers (host side, contiguous) ───────────────────────
-    size_t szA_l = (size_t)B * local_M * local_K;
-    size_t szB_l = (size_t)B * local_K * local_N;
-    size_t szC_l = (size_t)B * local_M * local_N;
-
-    std::vector<half>  h_A_shard(szA_l);
-    std::vector<half>  h_B_shard(szB_l);
-    std::vector<float> h_C_shard(szC_l);
+    // Point 1: out-of-core mode.
+    // Keep only one batch-chunk shard in host memory at a time.
+    size_t szA_l = (size_t)local_M * local_K;
+    size_t szB_l = (size_t)local_K * local_N;
+    size_t szC_l = (size_t)local_M * local_N;
 
     // ── Timing across all ranks ──────────────────────────────────────────────
     float total_ms = 0.f;
+    int total_launches = 0;
 
     for (int rank = 0; rank < num_ranks; ++rank) {
         RankCoord coord = rank_to_coord(rank, tp_cols);
         int device = rank % num_gpus;         // graceful fallback for sim mode
         CHECK_CUDA(cudaSetDevice(device));
 
-        // Pack non-contiguous A and B submatrices into contiguous shards
-        pack_shard_A(h_A.data(), h_A_shard.data(), M, K, B, local_M, local_K, coord);
-        pack_shard_B(h_B.data(), h_B_shard.data(), K, N, B, local_K, local_N, coord);
+        // Double-buffered pinned host staging (point 2)
+        PinnedBuffer<half>  h_A_stage0(szA_l), h_A_stage1(szA_l);
+        PinnedBuffer<half>  h_B_stage0(szB_l), h_B_stage1(szB_l);
+        PinnedBuffer<float> h_C_stage0(szC_l), h_C_stage1(szC_l);
 
-        DeviceBuffer<half>  d_A(szA_l);
-        DeviceBuffer<half>  d_B(szB_l);
-        DeviceBuffer<float> d_C(szC_l);
-        CHECK_CUDA(cudaMemcpy(d_A.get(), h_A_shard.data(), szA_l * sizeof(half), cudaMemcpyHostToDevice));
-        CHECK_CUDA(cudaMemcpy(d_B.get(), h_B_shard.data(), szB_l * sizeof(half), cudaMemcpyHostToDevice));
-        CHECK_CUDA(cudaMemset(d_C.get(), 0, szC_l * sizeof(float)));
+        // Double-buffered device buffers
+        DeviceBuffer<half>  d_A0(szA_l), d_A1(szA_l);
+        DeviceBuffer<half>  d_B0(szB_l), d_B1(szB_l);
+        DeviceBuffer<float> d_C0(szC_l), d_C1(szC_l);
 
-        GemmConfig cfg{
-            .M = M, .N = N, .K = K,
-            .num_batches = B,
-            .warmups = 1, .runs = args.profile_runs,
-            .tp_rows = tp_rows, .tp_cols = tp_cols,
-            .gpu_rank = rank
-        };
+        // Separate streams to overlap transfer/compute
+        CudaStream h2d_stream;
+        CudaStream compute_stream;
+        CudaStream d2h_stream;
 
-        Solver solver;
-        solver.configure(cfg);
-        float ms = solver.run(d_A.get(), d_B.get(), d_C.get());
-        total_ms += ms;
+        // Per-slot sync events
+        CudaEvent ev_h2d_done0, ev_h2d_done1;
+        CudaEvent ev_compute_done0, ev_compute_done1;
 
-        // Collect C shard and place it back into the global output
-        CHECK_CUDA(cudaMemcpy(h_C_shard.data(), d_C.get(), szC_l * sizeof(float), cudaMemcpyDeviceToHost));
-        unpack_shard_C(h_C_shard.data(), h_C_global.data(), M, N, B, local_M, local_N, coord);
+        GemmConfig cfg{};
+        cfg.M = M;
+        cfg.N = N;
+        cfg.K = K;
+        cfg.num_batches = 1;
+        cfg.warmups = 0;
+        cfg.runs = args.profile_runs;
+        cfg.tp_rows = tp_rows;
+        cfg.tp_cols = tp_cols;
+        cfg.gpu_rank = rank;
 
-        printf("  rank %d (GPU %d) [row=%d col=%d]  A[%d×%d] B[%d×%d] → C[%d×%d]  %.3f ms\n",
+        float rank_ms_accum = 0.f;
+        bool slot_initialized[2] = {false, false};
+
+        CudaEvent ev_d2h_done0, ev_d2h_done1;
+
+        for (int b = 0; b < B; ++b) {
+            const int slot = b & 1;
+
+            half* h_A_stage = slot ? h_A_stage1.get() : h_A_stage0.get();
+            half* h_B_stage = slot ? h_B_stage1.get() : h_B_stage0.get();
+            float* h_C_stage = slot ? h_C_stage1.get() : h_C_stage0.get();
+
+            half* d_A = slot ? d_A1.get() : d_A0.get();
+            half* d_B = slot ? d_B1.get() : d_B0.get();
+            float* d_C = slot ? d_C1.get() : d_C0.get();
+
+            CudaEvent& ev_h2d_done = slot ? ev_h2d_done1 : ev_h2d_done0;
+            CudaEvent& ev_compute_done = slot ? ev_compute_done1 : ev_compute_done0;
+            CudaEvent& ev_d2h_done = slot ? ev_d2h_done1 : ev_d2h_done0;
+
+            // When reusing a slot, wait until its prior D2H finished.
+            if (slot_initialized[slot]) {
+                CHECK_CUDA(cudaEventSynchronize(ev_d2h_done));
+            }
+
+            // 1) Fill pinned host shard buffers for this batch/rank
+            fill_rank_batch_shards(h_A_stage, h_B_stage,
+                                   M, N, K, local_M, local_N, local_K, b, coord);
+
+            // 2) Async H2D on transfer stream
+            CHECK_CUDA(cudaMemcpyAsync(d_A, h_A_stage, szA_l * sizeof(half),
+                                       cudaMemcpyHostToDevice, h2d_stream));
+            CHECK_CUDA(cudaMemcpyAsync(d_B, h_B_stage, szB_l * sizeof(half),
+                                       cudaMemcpyHostToDevice, h2d_stream));
+            CHECK_CUDA(cudaMemsetAsync(d_C, 0, szC_l * sizeof(float), h2d_stream));
+            CHECK_CUDA(cudaEventRecord(ev_h2d_done, h2d_stream));
+
+            // 3) Compute waits for H2D completion of this slot
+            CHECK_CUDA(cudaStreamWaitEvent(compute_stream, ev_h2d_done, 0));
+
+            // Timed kernel launches on compute stream
+            CudaEvent ev_start, ev_stop;
+            CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
+            for (int i = 0; i < args.profile_runs; ++i) {
+                launch_kernel(d_A, d_B, d_C, cfg, compute_stream);
+            }
+            CHECK_CUDA(cudaEventRecord(ev_stop, compute_stream));
+
+            // 4) D2H stream waits for compute completion and starts async copy
+            CHECK_CUDA(cudaEventRecord(ev_compute_done, compute_stream));
+            CHECK_CUDA(cudaStreamWaitEvent(d2h_stream, ev_compute_done, 0));
+            CHECK_CUDA(cudaMemcpyAsync(h_C_stage, d_C, szC_l * sizeof(float),
+                                       cudaMemcpyDeviceToHost, d2h_stream));
+            CHECK_CUDA(cudaEventRecord(ev_d2h_done, d2h_stream));
+
+            CHECK_CUDA(cudaEventSynchronize(ev_stop));
+            float ms = 0.f;
+            CHECK_CUDA(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+            ms /= args.profile_runs;
+
+            rank_ms_accum += ms;
+            total_ms += ms;
+            total_launches += 1;
+            slot_initialized[slot] = true;
+        }
+
+        CHECK_CUDA(cudaStreamSynchronize(h2d_stream));
+        CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+        CHECK_CUDA(cudaStreamSynchronize(d2h_stream));
+
+        printf("  rank %d (GPU %d) [row=%d col=%d]  A[%d×%d] B[%d×%d] -> C[%d×%d]  %.3f ms avg over %d batches\n",
                rank, device, coord.row, coord.col,
-               local_M, local_K, local_K, local_N, local_M, local_N, ms);
+               local_M, local_K, local_K, local_N, local_M, local_N,
+               rank_ms_accum / B, B);
     }
 
-    return total_ms / num_ranks;   // average across ranks
+    return total_launches ? (total_ms / total_launches) : 0.f;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────

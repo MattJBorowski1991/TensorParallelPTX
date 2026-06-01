@@ -26,6 +26,25 @@ struct DeviceBuffer {
     T* get() const {return ptr; } // allow to use .get() also on const objects
 };
 
+template<typename T>
+struct PinnedBuffer {
+    T* ptr = nullptr;
+    explicit PinnedBuffer(size_t n) { CHECK_CUDA(cudaMallocHost(&ptr, n * sizeof(T))); }
+    ~PinnedBuffer() { if (ptr) CHECK_CUDA(cudaFreeHost(ptr)); }
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+    PinnedBuffer(PinnedBuffer&& other) noexcept : ptr(other.ptr) { other.ptr = nullptr; }
+    PinnedBuffer& operator=(PinnedBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr) CHECK_CUDA(cudaFreeHost(ptr));
+            ptr = other.ptr;
+            other.ptr = nullptr;
+        }
+        return *this;
+    }
+    T* get() const { return ptr; }
+};
+
 struct CudaEvent{
     cudaEvent_t ev;
     CudaEvent() { cudaEventCreate(&ev); }
