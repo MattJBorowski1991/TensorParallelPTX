@@ -27,12 +27,12 @@ void launch_kernel(const half* A, const half* B, float* C,
 
 // ── Command-line parsing ──────────────────────────────────────────────────────
 struct Args {
-    int M = 8192, N = 8192, K = 8192;
-    int num_batches = 4;
-    int tp_rows = 2, tp_cols = 2;          // Default 2D TP mesh: 2x2 (4 GPUs)
-    bool verify = true;
+    int M = DEFAULT_M, N = DEFAULT_N, K = DEFAULT_K;
+    int num_batches = DEFAULT_NUM_BATCHES;
+    int tp_rows = DEFAULT_TP_ROWS, tp_cols = DEFAULT_TP_COLS; // Default 2D TP mesh: 2x2 (4 GPUs)
+    bool verify = false;
     bool profile = true;
-    int profile_runs = 5;
+    int profile_runs = DEFAULT_PROFILE_RUNS;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -217,7 +217,7 @@ static float run_profile(const Args& args) {
         for (int col = 0; col < tp_cols; ++col) {
             int rank = row * tp_cols + col;
             ranks[col] = rank;
-            devices[col] = rank; // validated: one device per rank
+            devices[col] = rank; // NCCL needs physical device IDs
         }
 
 #ifdef USE_NCCL
@@ -367,10 +367,14 @@ int main(int argc, char** argv) {
     if (args.profile) {
         printf("\n--- Profiling (%d×%d mesh) ---\n", args.tp_rows, args.tp_cols);
         float avg_ms = run_profile(args);
+        if (avg_ms <= 0.0f) {
+            fprintf(stderr, "[profile] skipped: runtime validation failed or no successful launches.\n");
+            return 1;
+        }
 
         double tflops = 2.0 * args.num_batches * (double)args.M * args.N * args.K
                         / (avg_ms * 1e-3) / 1e12;
-        printf("[profile] avg across ranks: %.3f ms | %.2f TFLOPS (compute only, no comms)\n",
+        printf("[profile] avg across ranks: %.3f ms | %.2f TFLOPS (includes comms when USE_NCCL is enabled)\n",
                avg_ms, tflops);
     }
 

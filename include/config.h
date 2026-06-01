@@ -12,6 +12,15 @@ constexpr int THREADS_PER_WARP = 32;
 #define WARP_TILES_Y    2
 #define WARPS_PER_BLOCK (WARP_TILES_X * WARP_TILES_Y)
 
+// ── Default profiling settings ───────────────────────────────────────────────
+constexpr int DEFAULT_M = 16384;
+constexpr int DEFAULT_N = 16384;
+constexpr int DEFAULT_K = 16384;
+constexpr int DEFAULT_TP_ROWS = 2;
+constexpr int DEFAULT_TP_COLS = 2;
+constexpr int DEFAULT_NUM_BATCHES = 4;
+constexpr int DEFAULT_PROFILE_RUNS = 5;
+
 // ── 2D Tensor Parallelism configuration ───────────────────────────────────────
 // For 2D TP: GPU mesh is (TP_ROW x TP_COL).
 // Each GPU (rank) holds tensors partitioned as:
