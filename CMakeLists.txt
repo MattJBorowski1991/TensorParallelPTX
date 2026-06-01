@@ -18,9 +18,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find required packages
 find_package(CUDA REQUIRED)
 
-# Optional: NCCL for multi-GPU (will be used for tensor parallelism later)
-# Uncomment and configure when adding multi-GPU support:
-# find_package(NCCL REQUIRED)
+# Optional NCCL for K-split correctness (tp_cols > 1)
+find_path(NCCL_INCLUDE_DIR nccl.h)
+find_library(NCCL_LIBRARY nccl)
+if (NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    message(STATUS "NCCL found: ${NCCL_LIBRARY}")
+    set(HAVE_NCCL ON)
+else()
+    message(STATUS "NCCL not found: building without USE_NCCL")
+    set(HAVE_NCCL OFF)
+endif()
 
 # ── Include directories ──────────────────────────────────────────────────────
 include_directories(
@@ -51,8 +58,11 @@ target_link_libraries(tensor_parallel_ptx
     cublas
 )
 
-# Optional: Link NCCL when multi-GPU support is added
-# target_link_libraries(tensor_parallel_ptx PRIVATE nccl)
+if (HAVE_NCCL)
+    target_include_directories(tensor_parallel_ptx PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(tensor_parallel_ptx PRIVATE ${NCCL_LIBRARY})
+    target_compile_definitions(tensor_parallel_ptx PRIVATE USE_NCCL=1)
+endif()
 
 # Set output directory
 set_target_properties(tensor_parallel_ptx PROPERTIES

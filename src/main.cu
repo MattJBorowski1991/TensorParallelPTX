@@ -9,6 +9,18 @@
 #include "src/solver.h"
 #include "src/data.h"
 
+#ifdef USE_NCCL
+#include <nccl.h>
+#define CHECK_NCCL(call) \
+    do { \
+        ncclResult_t r_ = (call); \
+        if (r_ != ncclSuccess) { \
+            fprintf(stderr, "NCCL Error at %s:%d: %s\n", __FILE__, __LINE__, ncclGetErrorString(r_)); \
+            exit(1); \
+        } \
+    } while (0)
+#endif
+
 // Implemented in kernels/*.cu
 void launch_kernel(const half* A, const half* B, float* C,
                    const GemmConfig& cfg, cudaStream_t stream);
@@ -45,6 +57,41 @@ static int query_num_gpus() {
     int n = 0;
     CHECK_CUDA(cudaGetDeviceCount(&n));
     return n;
+}
+
+static bool validate_runtime(const Args& args, int num_gpus) {
+    if (args.M <= 0 || args.N <= 0 || args.K <= 0 || args.num_batches <= 0 || args.profile_runs <= 0) {
+        fprintf(stderr, "[error] M/N/K, num_batches, and profile_runs must be > 0.\n");
+        return false;
+    }
+    if (args.tp_rows <= 0 || args.tp_cols <= 0) {
+        fprintf(stderr, "[error] tp_rows/tp_cols must be > 0.\n");
+        return false;
+    }
+    if (args.M % args.tp_rows != 0 || args.N % args.tp_cols != 0 || args.K % args.tp_cols != 0) {
+        fprintf(stderr,
+                "[error] divisibility check failed: require M%%tp_rows==0, N%%tp_cols==0, K%%tp_cols==0. "
+                "Got M=%d N=%d K=%d tp_rows=%d tp_cols=%d\n",
+                args.M, args.N, args.K, args.tp_rows, args.tp_cols);
+        return false;
+    }
+
+    const int num_ranks = args.tp_rows * args.tp_cols;
+    if (num_gpus < num_ranks) {
+        fprintf(stderr,
+                "[error] this path requires one physical GPU per rank. requested ranks=%d available_gpus=%d\n",
+                num_ranks, num_gpus);
+        return false;
+    }
+
+#ifndef USE_NCCL
+    if (args.tp_cols > 1) {
+        fprintf(stderr, "[error] tp_cols > 1 requires NCCL build support (USE_NCCL).\n");
+        return false;
+    }
+#endif
+
+    return true;
 }
 
 // ── Out-of-core shard generation (no global host A/B materialization) ───────
@@ -152,11 +199,7 @@ static float run_profile(const Args& args) {
     const int local_N = N / tp_cols;
     const int local_K = K / tp_cols;
 
-    if (num_gpus < num_ranks) {
-        printf("[warn] requested %d GPUs but only %d available — "
-               "mapping multiple ranks to GPU 0 (simulation mode)\n",
-               num_ranks, num_gpus);
-    }
+    if (!validate_runtime(args, num_gpus)) return 0.f;
 
     // Point 1: out-of-core mode.
     // Keep only one batch-chunk shard in host memory at a time.
@@ -168,115 +211,137 @@ static float run_profile(const Args& args) {
     float total_ms = 0.f;
     int total_launches = 0;
 
-    for (int rank = 0; rank < num_ranks; ++rank) {
-        RankCoord coord = rank_to_coord(rank, tp_cols);
-        int device = rank % num_gpus;         // graceful fallback for sim mode
-        CHECK_CUDA(cudaSetDevice(device));
-
-        // Double-buffered pinned host staging (point 2)
-        PinnedBuffer<half>  h_A_stage0(szA_l), h_A_stage1(szA_l);
-        PinnedBuffer<half>  h_B_stage0(szB_l), h_B_stage1(szB_l);
-        PinnedBuffer<float> h_C_stage0(szC_l), h_C_stage1(szC_l);
-
-        // Double-buffered device buffers
-        DeviceBuffer<half>  d_A0(szA_l), d_A1(szA_l);
-        DeviceBuffer<half>  d_B0(szB_l), d_B1(szB_l);
-        DeviceBuffer<float> d_C0(szC_l), d_C1(szC_l);
-
-        // Separate streams to overlap transfer/compute
-        CudaStream h2d_stream;
-        CudaStream compute_stream;
-        CudaStream d2h_stream;
-
-        // Per-slot sync events
-        CudaEvent ev_h2d_done0, ev_h2d_done1;
-        CudaEvent ev_compute_done0, ev_compute_done1;
-
-        GemmConfig cfg{};
-        cfg.M = M;
-        cfg.N = N;
-        cfg.K = K;
-        cfg.num_batches = 1;
-        cfg.warmups = 0;
-        cfg.runs = args.profile_runs;
-        cfg.tp_rows = tp_rows;
-        cfg.tp_cols = tp_cols;
-        cfg.gpu_rank = rank;
-
-        float rank_ms_accum = 0.f;
-        bool slot_initialized[2] = {false, false};
-
-        CudaEvent ev_d2h_done0, ev_d2h_done1;
-
-        for (int b = 0; b < B; ++b) {
-            const int slot = b & 1;
-
-            half* h_A_stage = slot ? h_A_stage1.get() : h_A_stage0.get();
-            half* h_B_stage = slot ? h_B_stage1.get() : h_B_stage0.get();
-            float* h_C_stage = slot ? h_C_stage1.get() : h_C_stage0.get();
-
-            half* d_A = slot ? d_A1.get() : d_A0.get();
-            half* d_B = slot ? d_B1.get() : d_B0.get();
-            float* d_C = slot ? d_C1.get() : d_C0.get();
-
-            CudaEvent& ev_h2d_done = slot ? ev_h2d_done1 : ev_h2d_done0;
-            CudaEvent& ev_compute_done = slot ? ev_compute_done1 : ev_compute_done0;
-            CudaEvent& ev_d2h_done = slot ? ev_d2h_done1 : ev_d2h_done0;
-
-            // When reusing a slot, wait until its prior D2H finished.
-            if (slot_initialized[slot]) {
-                CHECK_CUDA(cudaEventSynchronize(ev_d2h_done));
-            }
-
-            // 1) Fill pinned host shard buffers for this batch/rank
-            fill_rank_batch_shards(h_A_stage, h_B_stage,
-                                   M, N, K, local_M, local_N, local_K, b, coord);
-
-            // 2) Async H2D on transfer stream
-            CHECK_CUDA(cudaMemcpyAsync(d_A, h_A_stage, szA_l * sizeof(half),
-                                       cudaMemcpyHostToDevice, h2d_stream));
-            CHECK_CUDA(cudaMemcpyAsync(d_B, h_B_stage, szB_l * sizeof(half),
-                                       cudaMemcpyHostToDevice, h2d_stream));
-            CHECK_CUDA(cudaMemsetAsync(d_C, 0, szC_l * sizeof(float), h2d_stream));
-            CHECK_CUDA(cudaEventRecord(ev_h2d_done, h2d_stream));
-
-            // 3) Compute waits for H2D completion of this slot
-            CHECK_CUDA(cudaStreamWaitEvent(compute_stream, ev_h2d_done, 0));
-
-            // Timed kernel launches on compute stream
-            CudaEvent ev_start, ev_stop;
-            CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
-            for (int i = 0; i < args.profile_runs; ++i) {
-                launch_kernel(d_A, d_B, d_C, cfg, compute_stream);
-            }
-            CHECK_CUDA(cudaEventRecord(ev_stop, compute_stream));
-
-            // 4) D2H stream waits for compute completion and starts async copy
-            CHECK_CUDA(cudaEventRecord(ev_compute_done, compute_stream));
-            CHECK_CUDA(cudaStreamWaitEvent(d2h_stream, ev_compute_done, 0));
-            CHECK_CUDA(cudaMemcpyAsync(h_C_stage, d_C, szC_l * sizeof(float),
-                                       cudaMemcpyDeviceToHost, d2h_stream));
-            CHECK_CUDA(cudaEventRecord(ev_d2h_done, d2h_stream));
-
-            CHECK_CUDA(cudaEventSynchronize(ev_stop));
-            float ms = 0.f;
-            CHECK_CUDA(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-            ms /= args.profile_runs;
-
-            rank_ms_accum += ms;
-            total_ms += ms;
-            total_launches += 1;
-            slot_initialized[slot] = true;
+    for (int row = 0; row < tp_rows; ++row) {
+        std::vector<int> devices(tp_cols);
+        std::vector<int> ranks(tp_cols);
+        for (int col = 0; col < tp_cols; ++col) {
+            int rank = row * tp_cols + col;
+            ranks[col] = rank;
+            devices[col] = rank; // validated: one device per rank
         }
 
-        CHECK_CUDA(cudaStreamSynchronize(h2d_stream));
-        CHECK_CUDA(cudaStreamSynchronize(compute_stream));
-        CHECK_CUDA(cudaStreamSynchronize(d2h_stream));
+#ifdef USE_NCCL
+        ncclComm_t row_comm;
+        CHECK_NCCL(ncclCommInitAll(&row_comm, tp_cols, devices.data()));
+#endif
 
-        printf("  rank %d (GPU %d) [row=%d col=%d]  A[%d×%d] B[%d×%d] -> C[%d×%d]  %.3f ms avg over %d batches\n",
-               rank, device, coord.row, coord.col,
-               local_M, local_K, local_K, local_N, local_M, local_N,
-               rank_ms_accum / B, B);
+        std::vector<PinnedBuffer<half>> h_A_stage;
+        std::vector<PinnedBuffer<half>> h_B_stage;
+        std::vector<PinnedBuffer<float>> h_C_stage;
+        std::vector<DeviceBuffer<half>> d_A;
+        std::vector<DeviceBuffer<half>> d_B;
+        std::vector<DeviceBuffer<float>> d_C;
+        std::vector<cudaStream_t> streams(tp_cols);
+
+        h_A_stage.reserve(tp_cols);
+        h_B_stage.reserve(tp_cols);
+        h_C_stage.reserve(tp_cols);
+        d_A.reserve(tp_cols);
+        d_B.reserve(tp_cols);
+        d_C.reserve(tp_cols);
+
+        for (int col = 0; col < tp_cols; ++col) {
+            h_A_stage.emplace_back(szA_l);
+            h_B_stage.emplace_back(szB_l);
+            h_C_stage.emplace_back(szC_l);
+            d_A.emplace_back(szA_l);
+            d_B.emplace_back(szB_l);
+            d_C.emplace_back(szC_l);
+            CHECK_CUDA(cudaSetDevice(devices[col]));
+            CHECK_CUDA(cudaStreamCreate(&streams[col]));
+        }
+
+        std::vector<float> rank_ms_accum(tp_cols, 0.f);
+
+        for (int b = 0; b < B; ++b) {
+            std::vector<cudaEvent_t> ev_start(tp_cols), ev_stop(tp_cols);
+
+            // H2D + kernel launch for each rank in this row-group
+            for (int col = 0; col < tp_cols; ++col) {
+                const int rank = ranks[col];
+                RankCoord coord = rank_to_coord(rank, tp_cols);
+                CHECK_CUDA(cudaSetDevice(devices[col]));
+
+                CHECK_CUDA(cudaEventCreate(&ev_start[col]));
+                CHECK_CUDA(cudaEventCreate(&ev_stop[col]));
+
+                fill_rank_batch_shards(h_A_stage[col].get(), h_B_stage[col].get(),
+                                       M, N, K, local_M, local_N, local_K, b, coord);
+
+                CHECK_CUDA(cudaMemcpyAsync(d_A[col].get(), h_A_stage[col].get(),
+                                           szA_l * sizeof(half), cudaMemcpyHostToDevice, streams[col]));
+                CHECK_CUDA(cudaMemcpyAsync(d_B[col].get(), h_B_stage[col].get(),
+                                           szB_l * sizeof(half), cudaMemcpyHostToDevice, streams[col]));
+                CHECK_CUDA(cudaMemsetAsync(d_C[col].get(), 0, szC_l * sizeof(float), streams[col]));
+
+                GemmConfig cfg{};
+                cfg.M = M;
+                cfg.N = N;
+                cfg.K = K;
+                cfg.num_batches = 1;
+                cfg.warmups = 0;
+                cfg.runs = args.profile_runs;
+                cfg.tp_rows = tp_rows;
+                cfg.tp_cols = tp_cols;
+                cfg.gpu_rank = rank;
+
+                CHECK_CUDA(cudaEventRecord(ev_start[col], streams[col]));
+                for (int i = 0; i < args.profile_runs; ++i) {
+                    launch_kernel(d_A[col].get(), d_B[col].get(), d_C[col].get(), cfg, streams[col]);
+                }
+            }
+
+#ifdef USE_NCCL
+            // Point 2: K-split correctness via row-group allreduce across tp_cols.
+            CHECK_NCCL(ncclGroupStart());
+            for (int col = 0; col < tp_cols; ++col) {
+                CHECK_NCCL(ncclAllReduce((const void*)d_C[col].get(), (void*)d_C[col].get(),
+                                         szC_l, ncclFloat, ncclSum, row_comm, streams[col]));
+            }
+            CHECK_NCCL(ncclGroupEnd());
+#endif
+
+            for (int col = 0; col < tp_cols; ++col) {
+                CHECK_CUDA(cudaSetDevice(devices[col]));
+                CHECK_CUDA(cudaEventRecord(ev_stop[col], streams[col]));
+                CHECK_CUDA(cudaEventSynchronize(ev_stop[col]));
+
+                float ms = 0.f;
+                CHECK_CUDA(cudaEventElapsedTime(&ms, ev_start[col], ev_stop[col]));
+                ms /= args.profile_runs;
+                rank_ms_accum[col] += ms;
+                total_ms += ms;
+                total_launches += 1;
+
+                CHECK_CUDA(cudaMemcpyAsync(h_C_stage[col].get(), d_C[col].get(),
+                                           szC_l * sizeof(float), cudaMemcpyDeviceToHost, streams[col]));
+            }
+
+            for (int col = 0; col < tp_cols; ++col) {
+                CHECK_CUDA(cudaSetDevice(devices[col]));
+                CHECK_CUDA(cudaStreamSynchronize(streams[col]));
+                CHECK_CUDA(cudaEventDestroy(ev_start[col]));
+                CHECK_CUDA(cudaEventDestroy(ev_stop[col]));
+            }
+        }
+
+        for (int col = 0; col < tp_cols; ++col) {
+            int rank = ranks[col];
+            RankCoord coord = rank_to_coord(rank, tp_cols);
+            printf("  rank %d (GPU %d) [row=%d col=%d]  A[%d×%d] B[%d×%d] -> C[%d×%d]  %.3f ms avg over %d batches\n",
+                   rank, devices[col], coord.row, coord.col,
+                   local_M, local_K, local_K, local_N, local_M, local_N,
+                   rank_ms_accum[col] / B, B);
+        }
+
+        for (int col = 0; col < tp_cols; ++col) {
+            CHECK_CUDA(cudaSetDevice(devices[col]));
+            CHECK_CUDA(cudaStreamDestroy(streams[col]));
+        }
+
+#ifdef USE_NCCL
+        CHECK_NCCL(ncclCommDestroy(row_comm));
+#endif
     }
 
     return total_launches ? (total_ms / total_launches) : 0.f;
