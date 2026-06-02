@@ -1,0 +1,39 @@
+# Build directories and generated build files
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Binaries and objects
+bin/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# CUDA intermediate artifacts
+*.ptx
+*.cubin
+*.fatbin
+*.fatbin.c
+*.module_id
+
+# Nsight Compute artifacts
+*.ncu-rep
+ncu_*.txt
+ncu_*.csv
+
+# Nsight Systems artifacts
+*.nsys-rep
+*.qdstrm
+*.sqlite
+nsys_*.txt
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
