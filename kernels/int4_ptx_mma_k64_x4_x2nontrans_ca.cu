@@ -5,6 +5,7 @@
 // - Uses native mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <stdint.h>
 #include "include/config.h"
 
@@ -180,4 +181,13 @@ void launch_kernel(const int8_t* A, const int8_t* BT, int32_t* C,
     );
     int4_ptx_mma_k64_db<<<blocks, threads, 0, stream>>>(A, BT, C, local_M, local_N, local_K);
     CHECK_CUDA(cudaGetLastError());
+}
+
+void launch_kernel(const half* A, const half* B, float* C,
+                   const GemmConfig& cfg, cudaStream_t stream) {
+    launch_kernel(reinterpret_cast<const int8_t*>(A),
+                  reinterpret_cast<const int8_t*>(B),
+                  reinterpret_cast<int32_t*>(C),
+                  cfg,
+                  stream);
 }

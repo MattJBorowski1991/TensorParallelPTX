@@ -6,10 +6,10 @@ project(TensorParallelPTX LANGUAGES CXX CUDA)
 
 # ── Kernel Variant Selection ──────────────────────────────────────────────────
 # Usage: cmake -DKERNEL_VARIANT=int8_wmma -S . -B build
-# Options: fp16_wmma (default), int8_wmma, int8_ptx, int4_wmma, int4_ptx
+# Options: fp16_wmma (default), int8_wmma, int8_ptx_mma_k32, int4_wmma, int4_ptx_mma_k64_x4_x2nontrans_ca
 set(KERNEL_VARIANT "fp16_wmma" CACHE STRING "Kernel variant to compile")
 set_property(CACHE KERNEL_VARIANT PROPERTY STRINGS 
-    "fp16_wmma" "int8_wmma" "int8_ptx" "int4_wmma" "int4_ptx")
+    "fp16_wmma" "int8_wmma" "int8_ptx_mma_k32" "int4_wmma" "int4_ptx_mma_k64_x4_x2nontrans_ca")
 
 # ── CUDA Configuration ────────────────────────────────────────────────────────
 set(CMAKE_CUDA_STANDARD 17)
@@ -60,13 +60,13 @@ if(KERNEL_VARIANT STREQUAL "fp16_wmma")
 elseif(KERNEL_VARIANT STREQUAL "int8_wmma")
     set(SELECTED_KERNEL kernels/int8_wmma.cu)
     set(KERNEL_DISPLAY_NAME "INT8 WMMA (m16n16k16)")
-elseif(KERNEL_VARIANT STREQUAL "int8_ptx")
+elseif(KERNEL_VARIANT STREQUAL "int8_ptx_mma_k32")
     set(SELECTED_KERNEL kernels/int8_ptx_mma_k32.cu)
     set(KERNEL_DISPLAY_NAME "INT8 PTX (m16n8k32)")
 elseif(KERNEL_VARIANT STREQUAL "int4_wmma")
     set(SELECTED_KERNEL kernels/int4_wmma.cu)
     set(KERNEL_DISPLAY_NAME "INT4 WMMA (m8n8k32, packed)")
-elseif(KERNEL_VARIANT STREQUAL "int4_ptx")
+elseif(KERNEL_VARIANT STREQUAL "int4_ptx_mma_k64_x4_x2nontrans_ca")
     set(SELECTED_KERNEL kernels/int4_ptx_mma_k64_x4_x2nontrans_ca.cu)
     set(KERNEL_DISPLAY_NAME "INT4 PTX (m16n8k64, packed)")
 else()

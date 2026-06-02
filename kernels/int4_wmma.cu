@@ -161,3 +161,12 @@ void launch_kernel(const int8_t* A, const int8_t* BT, int32_t* C,
     int4_wmma_db<<<blocks, threads, 0, stream>>>(A, BT, C, local_M, local_N, local_K);
     CHECK_CUDA(cudaGetLastError());
 }
+
+void launch_kernel(const half* A, const half* B, float* C,
+                   const GemmConfig& cfg, cudaStream_t stream) {
+    launch_kernel(reinterpret_cast<const int8_t*>(A),
+                  reinterpret_cast<const int8_t*>(B),
+                  reinterpret_cast<int32_t*>(C),
+                  cfg,
+                  stream);
+}
