@@ -1,0 +1,1 @@
+ -lcudart -lcublas "/usr/lib/x86_64-linux-gnu/libnccl.so" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

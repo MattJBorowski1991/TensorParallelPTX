@@ -60,3 +60,72 @@ cmake --build build -j
 ```bash
 ./build/bin/tensor_parallel_ptx --M 4096 --N 4096 --K 4096 --tp-rows 2 --tp-cols 2 --B 1 --profile-runs 3 --no-verify
 ```
+
+## Nsight Compute (all metrics)
+
+Run from repo root. Use a small shape for NCU to keep collection time reasonable.
+
+### 1) Text file with all collected metrics
+
+```bash
+ncu --set full --target-processes all \
+	./build/bin/tensor_parallel_ptx \
+	--M 1024 --N 1024 --K 1024 --tp-rows 2 --tp-cols 2 --B 1 --profile-runs 1 --no-verify \
+	> ncu_all_metrics.txt 2>&1
+```
+
+### 2) `.ncu-rep` report with all collected metrics
+
+```bash
+ncu --set full --target-processes all -o ncu_all_metrics \
+	./build/bin/tensor_parallel_ptx \
+	--M 1024 --N 1024 --K 1024 --tp-rows 2 --tp-cols 2 --B 1 --profile-runs 1 --no-verify
+```
+
+This creates `ncu_all_metrics.ncu-rep`.
+
+## Nsight Systems 
+
+```bash
+nsys profile --force-overwrite true \
+  --trace cuda,nvtx,osrt \
+  --sample=none \
+  --cuda-memory-usage=true \
+  -o tp_timeline \
+  ./build/bin/tensor_parallel_ptx \
+  --M 1024 --N 1024 --K 1024 --tp-rows 2 --tp-cols 2 --B 4 --profile-runs 5 --no-verify
+```
+
+This is a good baseline Nsight Systems command for end-to-end TP profiling.
+
+- Captures CUDA API + kernels, NVTX ranges (if present), and OS runtime activity.
+- Writes `tp_timeline.nsys-rep` (report) and `tp_timeline.qdstrm` (raw stream).
+- Uses `--sample=none` to reduce overhead and avoid CPU sampling noise.
+
+Common optional additions (use only when needed):
+
+```bash
+# Include NCCL API tracing explicitly in the timeline
+--trace cuda,nvtx,osrt,nccl
+
+# Add CUDA backtraces for launch-site attribution (higher overhead)
+--cudabacktrace=true
+
+# Enable CPU sampling for host-side hotspot analysis
+--sample=cpu
+
+# Collect GPU metrics over time (requires supported platform/GPU)
+--gpu-metrics-device=all
+```
+
+For quick communication/overlap debugging, prefer adding `,nccl` to `--trace` first.
+
+### Export a readable Nsight Systems text summary
+
+```bash
+nsys stats --report cuda_api_gpu_sum,cuda_api_sum,cuda_gpu_kern_sum,osrt_sum,nvtx_sum \
+  --format table \
+  tp_timeline.nsys-rep > nsys_summary.txt
+```
+
+If `ncclsum` appears in `nsys stats --help-reports` on your version, you can add it to include NCCL summary stats.

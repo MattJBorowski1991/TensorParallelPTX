@@ -1,0 +1,3 @@
+/teamspace/studios/this_studio/TensorParallelPTX/build/CMakeFiles/tensor_parallel_ptx.dir
+/teamspace/studios/this_studio/TensorParallelPTX/build/CMakeFiles/edit_cache.dir
+/teamspace/studios/this_studio/TensorParallelPTX/build/CMakeFiles/rebuild_cache.dir
