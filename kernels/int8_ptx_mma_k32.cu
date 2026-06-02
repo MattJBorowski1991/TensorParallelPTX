@@ -61,13 +61,13 @@ __global__ void int8_ptx_mma_k32_true_db(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ BT,
     int32_t*      __restrict__ C,
-    int M, int N, int K
+    int local_M, int local_N, int local_K
 ){
     const int batch = blockIdx.z;
 
-    const int8_t* __restrict__ A_b  = A  + batch * M * K;
-    const int8_t* __restrict__ BT_b = BT + batch * N * K;
-    int32_t*      __restrict__ C_b  = C  + batch * M * N;
+    const int8_t* __restrict__ A_b  = A  + batch * local_M * local_K;
+    const int8_t* __restrict__ BT_b = BT + batch * local_N * local_K;
+    int32_t*      __restrict__ C_b  = C  + batch * local_M * local_N;
 
     const int tid     = threadIdx.x;
     const int warp_id = tid / THREADS_PER_WARP;
@@ -78,7 +78,7 @@ __global__ void int8_ptx_mma_k32_true_db(
 
     const int tile_row = blockIdx.y * (WMMA_M * WARP_TILES_Y) + warp_tile_row * WMMA_M;
     const int tile_col = blockIdx.x * (WMMA_N * WARP_TILES_X) + warp_tile_col * WMMA_N;
-    if (tile_row >= M || tile_col >= N) return;
+    if (tile_row >= local_M || tile_col >= local_N) return;
 
     __shared__ __align__(16) int8_t As[2][WARPS_PER_BLOCK][WMMA_M][WMMA_K + PAD];
     __shared__ __align__(16) int8_t Bs[2][WARPS_PER_BLOCK][WMMA_N][WMMA_K + PAD];
@@ -90,12 +90,12 @@ __global__ void int8_ptx_mma_k32_true_db(
     for (int i = lane_id; i < WMMA_M * WMMA_K; i += THREADS_PER_WARP) {
         const int row = i / WMMA_K;
         const int col = i % WMMA_K;
-        As[buf][warp_id][row][col] = A_b[(tile_row + row) * K + col];
+        As[buf][warp_id][row][col] = A_b[(tile_row + row) * local_K + col];
     }
     for (int i = lane_id; i < WMMA_N * WMMA_K; i += THREADS_PER_WARP) {
         const int n = i / WMMA_K;
         const int col = i % WMMA_K;
-        Bs[buf][warp_id][n][col] = BT_b[(tile_col + n) * K + col];
+        Bs[buf][warp_id][n][col] = BT_b[(tile_col + n) * local_K + col];
     }
     __syncthreads();
 
@@ -104,14 +104,14 @@ __global__ void int8_ptx_mma_k32_true_db(
     ldmatrix_b_k32(rb0, Bs[buf][warp_id], lane_id, 0);
     ldmatrix_b_k32(rb1, Bs[buf][warp_id], lane_id, 8);
 
-    for (int k = WMMA_K; k < K; k += WMMA_K) {
+    for (int k = WMMA_K; k < local_K; k += WMMA_K) {
         const int next = 1 - buf;
 
         for (int i = lane_id; i < (WMMA_M * WMMA_K) / 16; i += THREADS_PER_WARP) {
             const int row = (i * 16) / WMMA_K;
             const int col = (i * 16) % WMMA_K;
             char*       dst      = (char*)&As[next][warp_id][row][col];
-            const char* src      = (const char*)&A_b[(tile_row + row) * K + col + k];
+            const char* src      = (const char*)&A_b[(tile_row + row) * local_K + col + k];
             const unsigned dst_addr = __cvta_generic_to_shared(dst);
             asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
         }
@@ -120,7 +120,7 @@ __global__ void int8_ptx_mma_k32_true_db(
             const int n = (i * 16) / WMMA_K;
             const int col = (i * 16) % WMMA_K;
             char*       dst      = (char*)&Bs[next][warp_id][n][col];
-            const char* src      = (const char*)&BT_b[(tile_col + n) * K + col + k];
+            const char* src      = (const char*)&BT_b[(tile_col + n) * local_K + col + k];
             const unsigned dst_addr = __cvta_generic_to_shared(dst);
             asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
         }
@@ -142,31 +142,36 @@ __global__ void int8_ptx_mma_k32_true_db(
     mma_int8_k32(rc0, ra, rb0);
     mma_int8_k32(rc1, ra, rb1);
 
-    int32_t* c_dst = C_b + tile_row * N + tile_col;
+    int32_t* c_dst = C_b + tile_row * local_N + tile_col;
     const int out_row0 = lane_id / 4;
     const int out_row1 = out_row0 + 8;
     const int out_col0 = (lane_id % 4) * 2;
     const int out_col1 = out_col0 + 1;
 
-    c_dst[out_row0 * N + out_col0]     = rc0[0];
-    c_dst[out_row0 * N + out_col1]     = rc0[1];
-    c_dst[out_row1 * N + out_col0]     = rc0[2];
-    c_dst[out_row1 * N + out_col1]     = rc0[3];
+    c_dst[out_row0 * local_N + out_col0]     = rc0[0];
+    c_dst[out_row0 * local_N + out_col1]     = rc0[1];
+    c_dst[out_row1 * local_N + out_col0]     = rc0[2];
+    c_dst[out_row1 * local_N + out_col1]     = rc0[3];
 
-    c_dst[out_row0 * N + out_col0 + 8] = rc1[0];
-    c_dst[out_row0 * N + out_col1 + 8] = rc1[1];
-    c_dst[out_row1 * N + out_col0 + 8] = rc1[2];
-    c_dst[out_row1 * N + out_col1 + 8] = rc1[3];
+    c_dst[out_row0 * local_N + out_col0 + 8] = rc1[0];
+    c_dst[out_row0 * local_N + out_col1 + 8] = rc1[1];
+    c_dst[out_row1 * local_N + out_col0 + 8] = rc1[2];
+    c_dst[out_row1 * local_N + out_col1 + 8] = rc1[3];
 }
 
 void launch_kernel(const int8_t* A, const int8_t* BT, int32_t* C,
                    const GemmConfig& cfg, cudaStream_t stream) {
+    // Compute local per-GPU dimensions based on 2D TP configuration
+    int local_M = cfg.M / cfg.tp_rows;
+    int local_N = cfg.N / cfg.tp_cols;
+    int local_K = cfg.K / cfg.tp_cols;
+    
     dim3 threads(THREADS_PER_WARP * WARPS_PER_BLOCK);
     dim3 blocks(
-        (cfg.N + WARP_TILES_X * WMMA_N - 1) / (WARP_TILES_X * WMMA_N),
-        (cfg.M + WARP_TILES_Y * WMMA_M - 1) / (WARP_TILES_Y * WMMA_M),
+        (local_N + WARP_TILES_X * WMMA_N - 1) / (WARP_TILES_X * WMMA_N),
+        (local_M + WARP_TILES_Y * WMMA_M - 1) / (WARP_TILES_Y * WMMA_M),
         cfg.num_batches
     );
-    int8_ptx_mma_k32_true_db<<<blocks, threads, 0, stream>>>(A, BT, C, cfg.M, cfg.N, cfg.K);
+    int8_ptx_mma_k32_true_db<<<blocks, threads, 0, stream>>>(A, BT, C, local_M, local_N, local_K);
     CHECK_CUDA(cudaGetLastError());
 }

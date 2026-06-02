@@ -48,26 +48,28 @@ set(BASELINE_KERNEL_SOURCES
     kernels/fp16_wmma.cu
 )
 
-# ── Build Target: TensorParallelPTX (baseline, single GPU) ──────────────────
+# ── Build Target: TensorParallelPTX (baseline with all kernel variants) ──────
 add_executable(tensor_parallel_ptx ${HOST_SOURCES} ${BASELINE_KERNEL_SOURCES})
 
 # Link CUDA libraries
-target_link_libraries(tensor_parallel_ptx
-    PRIVATE
-    cudart
-    cublas
-)
-
-if (HAVE_NCCL)
-    target_include_directories(tensor_parallel_ptx PRIVATE ${NCCL_INCLUDE_DIR})
-    target_link_libraries(tensor_parallel_ptx PRIVATE ${NCCL_LIBRARY})
-    target_compile_definitions(tensor_parallel_ptx PRIVATE USE_NCCL=1)
-endif()
-
-# Set output directory
-set_target_properties(tensor_parallel_ptx PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
+foreach(target tensor_parallel_ptx)
+    target_link_libraries(${target}
+        PRIVATE
+        cudart
+        cublas
+    )
+    
+    if (HAVE_NCCL)
+        target_include_directories(${target} PRIVATE ${NCCL_INCLUDE_DIR})
+        target_link_libraries(${target} PRIVATE ${NCCL_LIBRARY})
+        target_compile_definitions(${target} PRIVATE USE_NCCL=1)
+    endif()
+    
+    # Set output directory
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+endforeach()
 
 # ── Build Information ──────────────────────────────────────────────────────
 message(STATUS "========== TensorParallelPTX Build Configuration ==========")

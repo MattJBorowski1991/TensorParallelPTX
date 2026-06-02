@@ -38,13 +38,13 @@ __global__ void int8_wmma_db(
     const int8_t* __restrict__ A,    // M×K row-major
     const int8_t* __restrict__ BT,   // N×K row-major  (transposed B)
     int32_t*      __restrict__ C,    // M×N row-major
-    int M, int N, int K
+    int local_M, int local_N, int local_K
 ){
     int batch = blockIdx.z;
 
-    const int8_t* __restrict__ A_b  = A  + batch * M * K;
-    const int8_t* __restrict__ BT_b = BT + batch * N * K;
-    int32_t*      __restrict__ C_b  = C  + batch * M * N;
+    const int8_t* __restrict__ A_b  = A  + batch * local_M * local_K;
+    const int8_t* __restrict__ BT_b = BT + batch * local_N * local_K;
+    int32_t*      __restrict__ C_b  = C  + batch * local_M * local_N;
 
     const int tid     = threadIdx.x;
     const int warp_id = tid / THREADS_PER_WARP;
@@ -55,7 +55,7 @@ __global__ void int8_wmma_db(
 
     const int tile_row = blockIdx.y * (WMMA_M * WARP_TILES_Y) + warp_tile_row * WMMA_M;
     const int tile_col = blockIdx.x * (WMMA_N * WARP_TILES_X) + warp_tile_col * WMMA_N;
-    if (tile_row >= M || tile_col >= N) return;
+    if (tile_row >= local_M || tile_col >= local_N) return;
 
     // Double-buffered SMEM.
     // As: M×K int8 tile (row-major, stride = WMMA_K + PAD).
@@ -76,11 +76,11 @@ __global__ void int8_wmma_db(
     // ── Prolog: scalar load, tile k=0 ─────────────────────────────────────────
     for (int i = lane_id; i < WMMA_M * WMMA_K; i += THREADS_PER_WARP) {
         int row = i / WMMA_K, col = i % WMMA_K;
-        As[buf][warp_id][row][col] = A_b[(tile_row + row) * K + col];
+        As[buf][warp_id][row][col] = A_b[(tile_row + row) * local_K + col];
     }
     for (int i = lane_id; i < WMMA_N * WMMA_K; i += THREADS_PER_WARP) {
         int row = i / WMMA_K, col = i % WMMA_K;
-        Bs[buf][warp_id][row][col] = BT_b[(tile_col + row) * K + col];
+        Bs[buf][warp_id][row][col] = BT_b[(tile_col + row) * local_K + col];
     }
     __syncthreads();
 
@@ -88,7 +88,7 @@ __global__ void int8_wmma_db(
     wmma::load_matrix_sync(b_frag, &Bs[buf][warp_id][0][0], WMMA_K + PAD);
 
     // ── K loop ────────────────────────────────────────────────────────────────
-    for (int k = WMMA_K; k < K; k += WMMA_K) {
+    for (int k = WMMA_K; k < local_K; k += WMMA_K) {
         int next = 1 - buf;
 
         // cp.async A: 16 bytes = 16 int8 elements = one full row of the 16×16 tile.
@@ -97,7 +97,7 @@ __global__ void int8_wmma_db(
             int elem     = i * 16;
             int row      = elem / WMMA_K, col = elem % WMMA_K;
             char*       dst      = (char*)&As[next][warp_id][row][col];
-            const char* src      = (const char*)&A_b[(tile_row + row) * K + (col + k)];
+            const char* src      = (const char*)&A_b[(tile_row + row) * local_K + (col + k)];
             unsigned    dst_addr = __cvta_generic_to_shared(dst);
             asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
         }
@@ -107,7 +107,7 @@ __global__ void int8_wmma_db(
             int elem     = i * 16;
             int row      = elem / WMMA_K, col = elem % WMMA_K;
             char*       dst      = (char*)&Bs[next][warp_id][row][col];
-            const char* src      = (const char*)&BT_b[(tile_col + row) * K + (col + k)];
+            const char* src      = (const char*)&BT_b[(tile_col + row) * local_K + (col + k)];
             unsigned    dst_addr = __cvta_generic_to_shared(dst);
             asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(dst_addr), "l"(src));
         }
@@ -127,19 +127,24 @@ __global__ void int8_wmma_db(
     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 
     // ── Store ─────────────────────────────────────────────────────────────────
-    int32_t* c_dst = C_b + tile_row * N + tile_col;
-    wmma::store_matrix_sync(c_dst, c_frag, N, wmma::mem_row_major);
+    int32_t* c_dst = C_b + tile_row * local_N + tile_col;
+    wmma::store_matrix_sync(c_dst, c_frag, local_N, wmma::mem_row_major);
 }
 
 // ── Launch wrapper ────────────────────────────────────────────────────────────
 void launch_kernel(const int8_t* A, const int8_t* BT, int32_t* C,
                    const GemmConfig& cfg, cudaStream_t stream) {
+    // Compute local per-GPU dimensions based on 2D TP configuration
+    int local_M = cfg.M / cfg.tp_rows;
+    int local_N = cfg.N / cfg.tp_cols;
+    int local_K = cfg.K / cfg.tp_cols;
+    
     dim3 threads(THREADS_PER_WARP * WARPS_PER_BLOCK);
     dim3 blocks(
-        (cfg.N + WARP_TILES_X * WMMA_N - 1) / (WARP_TILES_X * WMMA_N),
-        (cfg.M + WARP_TILES_Y * WMMA_M - 1) / (WARP_TILES_Y * WMMA_M),
+        (local_N + WARP_TILES_X * WMMA_N - 1) / (WARP_TILES_X * WMMA_N),
+        (local_M + WARP_TILES_Y * WMMA_M - 1) / (WARP_TILES_Y * WMMA_M),
         cfg.num_batches
     );
-    int8_wmma_db<<<blocks, threads, 0, stream>>>(A, BT, C, cfg.M, cfg.N, cfg.K);
+    int8_wmma_db<<<blocks, threads, 0, stream>>>(A, BT, C, local_M, local_N, local_K);
     CHECK_CUDA(cudaGetLastError());
 }
