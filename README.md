@@ -128,6 +128,18 @@ torchrun --standalone --nproc_per_node=4 --no-python ./build/bin/tensor_parallel
   --M 4096 --N 4096 --K 4096 --tp-rows 2 --tp-cols 2 --B 1 --chunk-batches 1 --profile-runs 3 --no-verify
 ```
 
+### Compile and run (fp16_wmma, 16384, Nsight Systems)
+
+```bash
+KERNEL=fp16_wmma
+OUTDIR=prof/nsys/fp16
+mkdir -p ${OUTDIR}
+cmake -DKERNEL_VARIANT=${KERNEL} -S . -B build
+cmake --build build -j
+nsys profile --force-overwrite true --trace cuda,nvtx,osrt --sample=none --cuda-memory-usage=true -o ${OUTDIR}/nsys_${KERNEL} torchrun --standalone --nproc_per_node=4 --no-python ./build/bin/tensor_parallel_ptx --M 16384 --N 16384 --K 16384 --tp-rows 2 --tp-cols 2 --B 4 --chunk-batches 1 --profile-runs 2 --no-verify --walltime-file ${OUTDIR}/walltime_${KERNEL}.txt
+nsys stats --report cuda_api_gpu_sum,cuda_api_sum,cuda_gpu_kern_sum,osrt_sum,nvtx_sum --format table ${OUTDIR}/nsys_${KERNEL}.nsys-rep > ${OUTDIR}/nsys_${KERNEL}_summary.txt
+```
+
 ### Nsight Compute (all metrics)
 
 Run from repo root. Use a small shape for NCU to keep collection time reasonable.
