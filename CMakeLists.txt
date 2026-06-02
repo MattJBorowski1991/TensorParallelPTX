@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
+if(POLICY CMP0146)
+    cmake_policy(SET CMP0146 OLD)
+endif()
 project(TensorParallelPTX LANGUAGES CXX CUDA)
+
+# ── Kernel Variant Selection ──────────────────────────────────────────────────
+# Usage: cmake -DKERNEL_VARIANT=int8_wmma -S . -B build
+# Options: fp16_wmma (default), int8_wmma, int8_ptx, int4_wmma, int4_ptx
+set(KERNEL_VARIANT "fp16_wmma" CACHE STRING "Kernel variant to compile")
+set_property(CACHE KERNEL_VARIANT PROPERTY STRINGS 
+    "fp16_wmma" "int8_wmma" "int8_ptx" "int4_wmma" "int4_ptx")
 
 # ── CUDA Configuration ────────────────────────────────────────────────────────
 set(CMAKE_CUDA_STANDARD 17)
@@ -43,9 +53,28 @@ set(HOST_SOURCES
     src/data.cu
 )
 
-# Baseline: fp16 WMMA (double-buffered)
+# Kernel variant selection
+if(KERNEL_VARIANT STREQUAL "fp16_wmma")
+    set(SELECTED_KERNEL kernels/fp16_wmma.cu)
+    set(KERNEL_DISPLAY_NAME "FP16 WMMA (m16n16k16)")
+elseif(KERNEL_VARIANT STREQUAL "int8_wmma")
+    set(SELECTED_KERNEL kernels/int8_wmma.cu)
+    set(KERNEL_DISPLAY_NAME "INT8 WMMA (m16n16k16)")
+elseif(KERNEL_VARIANT STREQUAL "int8_ptx")
+    set(SELECTED_KERNEL kernels/int8_ptx_mma_k32.cu)
+    set(KERNEL_DISPLAY_NAME "INT8 PTX (m16n8k32)")
+elseif(KERNEL_VARIANT STREQUAL "int4_wmma")
+    set(SELECTED_KERNEL kernels/int4_wmma.cu)
+    set(KERNEL_DISPLAY_NAME "INT4 WMMA (m8n8k32, packed)")
+elseif(KERNEL_VARIANT STREQUAL "int4_ptx")
+    set(SELECTED_KERNEL kernels/int4_ptx_mma_k64_x4_x2nontrans_ca.cu)
+    set(KERNEL_DISPLAY_NAME "INT4 PTX (m16n8k64, packed)")
+else()
+    message(FATAL_ERROR "Unknown KERNEL_VARIANT: ${KERNEL_VARIANT}")
+endif()
+
 set(BASELINE_KERNEL_SOURCES
-    kernels/fp16_wmma.cu
+    ${SELECTED_KERNEL}
 )
 
 # ── Build Target: TensorParallelPTX (baseline with all kernel variants) ──────
@@ -53,6 +82,11 @@ add_executable(tensor_parallel_ptx ${HOST_SOURCES} ${BASELINE_KERNEL_SOURCES})
 
 # Link CUDA libraries
 foreach(target tensor_parallel_ptx)
+    target_compile_definitions(${target}
+        PRIVATE
+        TP_KERNEL_VARIANT="${KERNEL_VARIANT}"
+    )
+
     target_link_libraries(${target}
         PRIVATE
         cudart
@@ -77,5 +111,6 @@ message(STATUS "CUDA Architecture: sm_89 (NVIDIA L4)")
 message(STATUS "CUDA Compute Capability: 8.9")
 message(STATUS "C++ Standard: C++17")
 message(STATUS "CUDA Standard: CUDA 17")
-message(STATUS "Kernel Variant: Baseline (fp16_wmma, double-buffered)")
+message(STATUS "Kernel Variant: ${KERNEL_DISPLAY_NAME}")
+message(STATUS "Build flag: -DKERNEL_VARIANT=${KERNEL_VARIANT}")
 message(STATUS "===========================================================")

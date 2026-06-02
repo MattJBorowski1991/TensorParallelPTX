@@ -30,6 +30,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <stdint.h>
+#include <cuda_fp16.h>
 using namespace nvcuda;
 #include "include/config.h"
 #include "include/cuda_utils.h"
@@ -147,4 +148,15 @@ void launch_kernel(const int8_t* A, const int8_t* BT, int32_t* C,
     );
     int8_wmma_db<<<blocks, threads, 0, stream>>>(A, BT, C, local_M, local_N, local_K);
     CHECK_CUDA(cudaGetLastError());
+}
+
+// Compatibility wrapper expected by src/main.cu and src/solver.cu.
+void launch_kernel(const half* A, const half* B, float* C,
+                   const GemmConfig& cfg, cudaStream_t stream) {
+    // Integer kernels are selected at compile time; host must provide matching buffers.
+    launch_kernel(reinterpret_cast<const int8_t*>(A),
+                  reinterpret_cast<const int8_t*>(B),
+                  reinterpret_cast<int32_t*>(C),
+                  cfg,
+                  stream);
 }

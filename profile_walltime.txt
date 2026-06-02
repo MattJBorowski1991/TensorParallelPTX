@@ -1,0 +1,1 @@
+2026-06-02 18:10:22 kernel=int8_wmma M=512 N=512 K=512 B=1 tp=1x1 runs=1 avg_rank_ms=0.121 wall_ms=0.121
