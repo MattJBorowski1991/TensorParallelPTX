@@ -49,6 +49,13 @@ include_directories(
 # Host-side implementations
 set(HOST_SOURCES
     src/main.cu
+    src/app/cli.cu
+    src/app/dist_context.cu
+    src/app/logging.cu
+    src/comm/nccl_utils.cu
+    src/tp/sharding.cu
+    src/tp/summa_runner.cu
+    src/verify/verify_runner.cu
     src/solver.cu
     src/data.cu
 )

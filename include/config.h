@@ -27,9 +27,10 @@ constexpr int DEFAULT_PROFILE_RUNS = 5;
 //   - A:  (M / TP_ROW) x (K / TP_COL)
 //   - B:  (K / TP_COL) x (N / TP_COL)  
 //   - C:  (M / TP_ROW) x (N / TP_COL)
-// This requires:
-//   1. Allgather/Allreduce on K-dimension (for A and B shards)
-//   2. Allreduce on C output to sum partial results
+// This requires SUMMA-style K-panel exchange per step:
+//   1. Broadcast A panel across each row communicator
+//   2. Broadcast B panel across each column communicator
+//   3. Accumulate partial C over all K panels
 
 // ── Runtime problem / benchmark configuration ────────────────────────────────────
 struct GemmConfig {

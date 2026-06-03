@@ -32,7 +32,7 @@ inline int coord_to_rank(int rank_row, int rank_col, int tp_cols) {
 // For a global problem (M, N, K) on a (tp_rows x tp_cols) mesh:
 //
 //   A  [M  x K ] → GPU(i,j) owns rows [i*lM, (i+1)*lM), K-cols [j*lK, (j+1)*lK)
-//   B  [K  x N ] → GPU(i,j) owns K-rows [j*lK, (j+1)*lK), N-cols [j*lN, (j+1)*lN)
+//   B  [K  x N ] → GPU(i,j) owns K-rows [i*lK, (i+1)*lK), N-cols [j*lN, (j+1)*lN)
 //   C  [M  x N ] → GPU(i,j) owns rows [i*lM, (i+1)*lM), N-cols [j*lN, (j+1)*lN)
 //
 // where lM = M/tp_rows, lN = N/tp_cols, lK = K/tp_cols.
@@ -66,7 +66,7 @@ inline void pack_shard_A(
 }
 
 // ── pack_shard_B ──────────────────────────────────────────────────────────────
-// Copies B[rank_col*lK : (rank_col+1)*lK,  rank_col*lN : (rank_col+1)*lN]
+// Copies B[rank_row*lK : (rank_row+1)*lK,  rank_col*lN : (rank_col+1)*lN]
 // into a contiguous buffer dst[lK x lN].
 // Handles batches: B_global is [num_batches x K x N].
 inline void pack_shard_B(
@@ -76,7 +76,7 @@ inline void pack_shard_B(
     int local_K, int local_N,
     RankCoord coord)
 {
-    const int row_offset = coord.col * local_K;   // B's row = K-axis, split by col rank
+    const int row_offset = coord.row * local_K;   // B's row = K-axis, split by row rank
     const int col_offset = coord.col * local_N;   // B's col = N-axis, split by col rank
     for (int b = 0; b < num_batches; ++b) {
         const half* B_b = B_global + (size_t)b * K * N;

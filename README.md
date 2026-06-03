@@ -8,17 +8,20 @@ TensorParallelPTX is a CUDA prototype for profiling large GEMMs with 2D tensor p
 - Splits the global GEMM into a 2D TP mesh (`tp_rows x tp_cols`), default `2x2` (4 ranks / 4 GPUs).
 - Uses out-of-core shard generation (no full global A/B/C allocation on host RAM).
 - Uses pinned host buffers and async copies for profiling flow.
-- If built with NCCL, performs row-group all-reduce for K-split correctness when `tp_cols > 1`.
+- If built with NCCL and `tp_cols > 1`, performs SUMMA-style panel broadcasts (A across rows, B across columns).
 
 ## Current workflow (implemented)
 
 - One CPU host process manages one GPU/rank (`torchrun`/MPI style launch).
 - Each rank uses two CUDA streams:
-  - Compute stream for GEMM.
-  - Communication stream for NCCL collectives.
-- Work is pipelined in batch chunks (`--chunk-batches`) with ping/pong C buffers.
-- Compute of chunk `i+1` can overlap communication of chunk `i`.
-- For `tp_cols > 1`, NCCL row-group all-reduce combines K-split partial sums.
+  - Compute stream for GEMM + accumulation.
+  - Communication stream for NCCL panel broadcasts.
+- Work is processed in batch chunks (`--chunk-batches`).
+- For each chunk and each K-panel step `p`, NCCL broadcasts:
+  - A panel from row root `col=p` to the row communicator.
+  - B panel from column root `row=p` to the column communicator.
+- Panel traffic is ping/pong double-buffered to overlap communication with compute.
+- Partial C results are accumulated over all panel steps.
 
 ## How tensor parallelism is done
 
@@ -34,7 +37,22 @@ Each rank `(row, col)` computes its local shard with:
 - `B_shard: local_K x local_N`
 - `C_shard: local_M x local_N`
 
-When `tp_cols > 1`, C shards are reduced across each row-group (NCCL all-reduce) to combine K-split partial sums.
+When `tp_cols > 1`, each rank performs `tp_cols` panel steps and accumulates local partial C contributions (SUMMA-style).
+
+## SUMMA details (current implementation)
+
+For rank `(i, j)` in a `tp_rows x tp_cols` mesh:
+
+- Local ownership:
+  - `A_ij`: rows `[i*lM, (i+1)*lM)`, K panel for local col ownership.
+  - `B_ij`: K rows `[i*lK, (i+1)*lK)`, cols `[j*lN, (j+1)*lN)`.
+  - `C_ij`: rows `[i*lM, (i+1)*lM)`, cols `[j*lN, (j+1)*lN)`.
+- For each panel step `p = 0 .. tp_cols-1`:
+  - Row communicator broadcast: `A_ip` is broadcast across row `i` (root `col=p`).
+  - Column communicator broadcast: `B_pj` is broadcast down column `j` (root `row=p`).
+  - Rank computes `C_ij += A_ip * B_pj`.
+- Communication is issued on `comm_stream`, compute/accumulation on `compute_stream`.
+- A/B panel traffic uses ping/pong buffers to overlap prefetch of step `p+1` with compute on step `p`.
 
 ## Launch model
 
@@ -53,7 +71,7 @@ Current defaults in `src/main.cu`:
 
 ## Chunk size (simple explanation)
 
-`--chunk-batches` is the chunk size for pipelining. It means how many batches are grouped into one compute+communication chunk.
+`--chunk-batches` is the chunk size. It means how many batches are grouped into one panel-broadcast + GEMM accumulation chunk.
 
 - If `B=4` and `--chunk-batches 1`: 4 chunks (`[0] [1] [2] [3]`) for maximum overlap opportunity.
 - If `B=4` and `--chunk-batches 2`: 2 chunks (`[0,1] [2,3]`) less launch overhead, less fine-grained overlap.
@@ -64,7 +82,7 @@ Rule of thumb:
 - Start with `--chunk-batches 1` for latency-focused profiling.
 - Increase to `2` or `4` if kernel launch/collective overhead becomes dominant.
 
-Summary: each GPU is managed by one host process and uses two CUDA streams. The compute stream runs GEMM for the current chunk, while the communication stream runs NCCL all-reduce for the previous/ready chunk. Double buffering (ping/pong C buffers) keeps these chunks separate in memory so compute and communication can overlap safely.
+Summary: each GPU is managed by one host process. For each chunk, the rank runs `tp_cols` panel steps, broadcasts A/B panels with NCCL (if enabled), runs GEMM for each step, and accumulates partial C.
 
 ### Concrete pipeline steps (per single GPU)
 
@@ -74,21 +92,15 @@ Example assumes `B=4`, `--chunk-batches 1` (chunks 0,1,2,3), and one GPU process
   - Build local `A`/`B` shards for all batches.
   - Copy `A`/`B` to device once.
 2. Start timing event.
-3. Chunk 0 on `ping` buffer:
-  - `stream0` (compute): memset `C_ping`, run GEMM(chunk0), record compute-done event.
-  - `stream1` (comm): wait on event, run NCCL all-reduce on `C_ping`, record comm-done-ping.
-4. Chunk 1 on `pong` buffer:
-  - `stream0`: memset `C_pong`, GEMM(chunk1), record compute-done.
-  - `stream1`: wait, all-reduce `C_pong`, record comm-done-pong.
-5. Chunk 2 reuses `ping`:
-  - `stream0` waits for comm-done-ping, then memset + GEMM(chunk2).
-  - `stream1` waits, all-reduce `C_ping`, record comm-done-ping.
-6. Chunk 3 reuses `pong`:
-  - `stream0` waits for comm-done-pong, then memset + GEMM(chunk3).
-  - `stream1` waits, all-reduce `C_pong`, record comm-done-pong.
-7. Stop timing on comm stream and synchronize.
+3. Chunk 0:
+  - Zero `C_accum`.
+  - For `p=0..tp_cols-1`: broadcast A/B panels for step `p`, run GEMM, accumulate into `C_accum`.
+  - While computing step `p`, the comm stream prefetches panels for step `p+1` into the other ping/pong buffer.
+4. Chunk 1:
+  - Repeat the same panel loop and accumulation.
+5. Continue for all chunks and stop timing.
 
-Overlap intuition (still per single GPU): while `stream1` communicates chunk `i`, `stream0` can compute chunk `i+1` on the other buffer.
+In the current implementation, communication and compute run on separate streams with event synchronization and ping/pong panel buffers.
 
 ## Build and run notes
 
