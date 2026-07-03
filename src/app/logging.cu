@@ -11,11 +11,16 @@ void print_run_header(const Args& args, int rank) {
     printf("\n=== TensorParallelPTX (unknown kernel variant) ===\n");
 #endif
     printf("Global problem:  M=%d  N=%d  K=%d  B=%d\n", args.M, args.N, args.K, args.num_batches);
+    printf("TP mode:         %s\n", tp_mode_name(args.tp_mode));
     printf("TP mesh:         %dx%d  (%d GPUs)\n", args.tp_rows, args.tp_cols, args.tp_rows * args.tp_cols);
-    printf("Per-GPU shard:   A[%dx%d]  B[%dx%d]  C[%dx%d]\n",
-           args.M / args.tp_rows, args.K / args.tp_cols,
-           args.K / args.tp_cols, args.N / args.tp_cols,
-           args.M / args.tp_rows, args.N / args.tp_cols);
+
+    // Per-rank shard dims depend on the distribution (see oned_runner.cu).
+    int lM = args.M / args.tp_rows;
+    int lN = args.N / args.tp_cols;
+    int lK = args.K / args.tp_cols;
+    if (args.tp_mode == TpMode::OneDCol) { lM = args.M; lN = args.N / args.tp_cols; lK = args.K; }
+    if (args.tp_mode == TpMode::OneDRow) { lM = args.M; lN = args.N; lK = args.K / args.tp_cols; }
+    printf("Per-GPU shard:   A[%dx%d]  B[%dx%d]  C[%dx%d]\n", lM, lK, lK, lN, lM, lN);
     printf("Chunking:        %d batch(es) per pipeline chunk\n", args.chunk_batches);
 }
 
@@ -63,9 +68,10 @@ void append_walltime_log(const Args& args, const ProfileStats& stats) {
 #endif
 
     fprintf(f,
-            "%s kernel=%s M=%d N=%d K=%d B=%d tp=%dx%d runs=%d avg_rank_ms=%.3f wall_ms=%.3f\n",
+            "%s kernel=%s mode=%s M=%d N=%d K=%d B=%d tp=%dx%d runs=%d avg_rank_ms=%.3f wall_ms=%.3f\n",
             ts,
             kernel_variant,
+            tp_mode_name(args.tp_mode),
             args.M,
             args.N,
             args.K,

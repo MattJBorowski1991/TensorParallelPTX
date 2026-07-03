@@ -10,11 +10,16 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 
 #include "include/config.h"
 #include "include/cuda_utils.h"
-#include "src/solver.h"
 #include "src/data.h"
+
+// Implemented in kernels/*.cu — one definition per build target. Int variants
+// reinterpret these pointers to their real types (int8/int4 in, int32 out).
+void launch_kernel(const half* A, const half* B, float* C,
+                   const GemmConfig& cfg, cudaStream_t stream);
 
 namespace {
 
@@ -285,14 +290,9 @@ void run_verify() {
     vcfg.N = kVerifyN;
     vcfg.K = kVerifyK;
     vcfg.num_batches = kVerifyBatches;
-    vcfg.warmups = 0;
-    vcfg.runs = 1;
-    vcfg.tp_rows = 1;
-    vcfg.tp_cols = 1;
-    vcfg.gpu_rank = 0;
-
-    Solver solver;
-    solver.configure(vcfg);
+    vcfg.local_M = kVerifyM;   // single-GPU: local == global
+    vcfg.local_N = kVerifyN;
+    vcfg.local_K = kVerifyK;
 
     if (kind == VerifyKind::Fp16) {
         std::vector<half> h_A((size_t)kVerifyBatches * kVerifyM * kVerifyK);
@@ -314,12 +314,41 @@ void run_verify() {
         CHECK_CUDA(cudaMemcpy(d_B.get(), h_B.data(), (size_t)kVerifyK * kVerifyN * sizeof(half), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemset(d_C.get(), 0, (size_t)kVerifyM * kVerifyN * sizeof(float)));
 
-        solver.run(d_A.get(), d_B.get(), d_C.get());
+        launch_kernel(d_A.get(), d_B.get(), d_C.get(), vcfg, /*stream=*/0);
+        CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaMemcpy(h_C_out.data(), d_C.get(), (size_t)kVerifyM * kVerifyN * sizeof(float), cudaMemcpyDeviceToHost));
         AccuracyResult acc = measure_accuracy(h_C_ref.data(), h_C_out.data(), kVerifyM, kVerifyN);
         printf("[verify] variant=%s M=%d N=%d K=%d cache=%s  %s  max_abs=%.4e  rmse=%.4e  rel=%.3f%%\n",
                variant.c_str(), kVerifyM, kVerifyN, kVerifyK, cache_hit ? "hit" : "miss",
                acc.pass ? "PASS" : "FAIL", acc.max_abs_err, acc.rmse, acc.real_err_pct);
+
+        // cuBLAS cross-check: GPU reference (fp16 in, fp32 accumulate),
+        // independent of the cached CPU reference. Row-major trick: compute
+        // col-major C^T = B^T * A^T by passing row-major B, A as-is.
+        cublasHandle_t cb{};
+        if (cublasCreate(&cb) == CUBLAS_STATUS_SUCCESS) {
+            DeviceBuffer<float> d_C_cublas((size_t)kVerifyM * kVerifyN);
+            const float alpha = 1.0f, beta = 0.0f;
+            cublasStatus_t st = cublasGemmEx(cb, CUBLAS_OP_N, CUBLAS_OP_N,
+                                             kVerifyN, kVerifyM, kVerifyK,
+                                             &alpha,
+                                             d_B.get(), CUDA_R_16F, kVerifyN,
+                                             d_A.get(), CUDA_R_16F, kVerifyK,
+                                             &beta,
+                                             d_C_cublas.get(), CUDA_R_32F, kVerifyN,
+                                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            if (st == CUBLAS_STATUS_SUCCESS) {
+                std::vector<float> h_C_cublas((size_t)kVerifyM * kVerifyN);
+                CHECK_CUDA(cudaMemcpy(h_C_cublas.data(), d_C_cublas.get(),
+                                      h_C_cublas.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                AccuracyResult cacc = measure_accuracy(h_C_cublas.data(), h_C_out.data(), kVerifyM, kVerifyN);
+                printf("[verify] cublas-ref  %s  max_abs=%.4e  rmse=%.4e  rel=%.3f%%\n",
+                       cacc.pass ? "PASS" : "FAIL", cacc.max_abs_err, cacc.rmse, cacc.real_err_pct);
+            } else {
+                fprintf(stderr, "[verify] cublas fp16 GemmEx failed (status=%d), cross-check skipped\n", (int)st);
+            }
+            cublasDestroy(cb);
+        }
         return;
     }
 
@@ -344,9 +373,10 @@ void run_verify() {
         CHECK_CUDA(cudaMemcpy(d_BT.get(), BT.data(), BT.size() * sizeof(int8_t), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemset(d_C.get(), 0, (size_t)kVerifyM * kVerifyN * sizeof(int32_t)));
 
-        solver.run(reinterpret_cast<const half*>(d_A.get()),
-                   reinterpret_cast<const half*>(d_BT.get()),
-                   reinterpret_cast<float*>(d_C.get()));
+        launch_kernel(reinterpret_cast<const half*>(d_A.get()),
+                      reinterpret_cast<const half*>(d_BT.get()),
+                      reinterpret_cast<float*>(d_C.get()), vcfg, /*stream=*/0);
+        CHECK_CUDA(cudaDeviceSynchronize());
 
         CHECK_CUDA(cudaMemcpy(C_out.data(), d_C.get(), (size_t)kVerifyM * kVerifyN * sizeof(int32_t), cudaMemcpyDeviceToHost));
         int32_t max_abs = 0;
@@ -355,6 +385,47 @@ void run_verify() {
         printf("[verify] variant=%s M=%d N=%d K=%d cache=%s  %s  max_abs=%d  rel=%.3f%%\n",
                variant.c_str(), kVerifyM, kVerifyN, kVerifyK, cache_hit ? "hit" : "miss",
                pass ? "PASS" : "FAIL", (int)max_abs, rel_pct);
+
+        // cuBLAS cross-check: int8 GemmEx with exact int32 accumulate.
+        // cuBLAS wants row-major B (K×N); the cache only stores BT — transpose back.
+        {
+            std::vector<int8_t> B_rm((size_t)kVerifyK * kVerifyN);
+            for (int n = 0; n < kVerifyN; ++n)
+                for (int k = 0; k < kVerifyK; ++k)
+                    B_rm[(size_t)k * kVerifyN + n] = BT[(size_t)n * kVerifyK + k];
+
+            cublasHandle_t cb{};
+            if (cublasCreate(&cb) == CUBLAS_STATUS_SUCCESS) {
+                DeviceBuffer<int8_t> d_B_rm(B_rm.size());
+                DeviceBuffer<int32_t> d_C_cublas((size_t)kVerifyM * kVerifyN);
+                CHECK_CUDA(cudaMemcpy(d_B_rm.get(), B_rm.data(), B_rm.size(), cudaMemcpyHostToDevice));
+                const int32_t alpha = 1, beta = 0;
+                // Same row-major trick as fp16: col-major C^T = B^T * A^T.
+                cublasStatus_t st = cublasGemmEx(cb, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                 kVerifyN, kVerifyM, kVerifyK,
+                                                 &alpha,
+                                                 d_B_rm.get(), CUDA_R_8I, kVerifyN,
+                                                 d_A.get(), CUDA_R_8I, kVerifyK,
+                                                 &beta,
+                                                 d_C_cublas.get(), CUDA_R_32I, kVerifyN,
+                                                 CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
+                if (st == CUBLAS_STATUS_SUCCESS) {
+                    std::vector<int32_t> C_cublas((size_t)kVerifyM * kVerifyN);
+                    CHECK_CUDA(cudaMemcpy(C_cublas.data(), d_C_cublas.get(),
+                                          C_cublas.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    int32_t cmax = 0;
+                    double crel = 0.0;
+                    const bool cpass = compare_int32_exact(C_cublas, C_out, &cmax, &crel);
+                    printf("[verify] cublas-ref  %s  max_abs=%d (exact int32)\n",
+                           cpass ? "PASS" : "FAIL", (int)cmax);
+                } else {
+                    // int8 GemmEx has layout/alignment restrictions that vary by
+                    // cuBLAS version — CPU reference above stays authoritative.
+                    fprintf(stderr, "[verify] cublas int8 GemmEx unsupported here (status=%d), cross-check skipped\n", (int)st);
+                }
+                cublasDestroy(cb);
+            }
+        }
         return;
     }
 
@@ -378,9 +449,10 @@ void run_verify() {
     CHECK_CUDA(cudaMemcpy(d_BT.get(), BT_packed.data(), BT_packed.size() * sizeof(int8_t), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_C.get(), 0, (size_t)kVerifyM * kVerifyN * sizeof(int32_t)));
 
-    solver.run(reinterpret_cast<const half*>(d_A.get()),
-               reinterpret_cast<const half*>(d_BT.get()),
-               reinterpret_cast<float*>(d_C.get()));
+    launch_kernel(reinterpret_cast<const half*>(d_A.get()),
+                  reinterpret_cast<const half*>(d_BT.get()),
+                  reinterpret_cast<float*>(d_C.get()), vcfg, /*stream=*/0);
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     CHECK_CUDA(cudaMemcpy(C_out.data(), d_C.get(), (size_t)kVerifyM * kVerifyN * sizeof(int32_t), cudaMemcpyDeviceToHost));
     int32_t max_abs = 0;
@@ -389,4 +461,7 @@ void run_verify() {
     printf("[verify] variant=%s M=%d N=%d K=%d cache=%s  %s  max_abs=%d  rel=%.3f%%\n",
            variant.c_str(), kVerifyM, kVerifyN, kVerifyK, cache_hit ? "hit" : "miss",
            pass ? "PASS" : "FAIL", (int)max_abs, rel_pct);
+    // No cuBLAS cross-check for int4: cuBLAS has no int4 GEMM. The CPU
+    // reference above is exact integer arithmetic and stays authoritative.
+    printf("[verify] cublas-ref  skipped (cuBLAS has no int4 GEMM)\n");
 }

@@ -1,7 +1,4 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
-if(POLICY CMP0146)
-    cmake_policy(SET CMP0146 OLD)
-endif()
 project(TensorParallelPTX LANGUAGES CXX CUDA)
 
 # ── Kernel Variant Selection ──────────────────────────────────────────────────
@@ -25,9 +22,6 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find required packages
-find_package(CUDA REQUIRED)
-
 # Optional NCCL for K-split correctness (tp_cols > 1)
 find_path(NCCL_INCLUDE_DIR nccl.h)
 find_library(NCCL_LIBRARY nccl)
@@ -40,10 +34,8 @@ else()
 endif()
 
 # ── Include directories ──────────────────────────────────────────────────────
-include_directories(
-    ${CMAKE_SOURCE_DIR}
-    ${CUDA_INCLUDE_DIRS}
-)
+# All sources are .cu, so nvcc provides the CUDA toolkit headers itself.
+include_directories(${CMAKE_SOURCE_DIR})
 
 # ── Source Files ────────────────────────────────────────────────────────────
 # Host-side implementations
@@ -55,8 +47,8 @@ set(HOST_SOURCES
     src/comm/nccl_utils.cu
     src/tp/sharding.cu
     src/tp/summa_runner.cu
+    src/tp/oned_runner.cu
     src/verify/verify_runner.cu
-    src/solver.cu
     src/data.cu
 )
 
@@ -80,37 +72,21 @@ else()
     message(FATAL_ERROR "Unknown KERNEL_VARIANT: ${KERNEL_VARIANT}")
 endif()
 
-set(BASELINE_KERNEL_SOURCES
-    ${SELECTED_KERNEL}
+# ── Build Target ──────────────────────────────────────────────────────────────
+add_executable(tensor_parallel_ptx ${HOST_SOURCES} ${SELECTED_KERNEL})
+
+target_compile_definitions(tensor_parallel_ptx PRIVATE TP_KERNEL_VARIANT="${KERNEL_VARIANT}")
+target_link_libraries(tensor_parallel_ptx PRIVATE cudart cublas)
+
+if (HAVE_NCCL)
+    target_include_directories(tensor_parallel_ptx PRIVATE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(tensor_parallel_ptx PRIVATE ${NCCL_LIBRARY})
+    target_compile_definitions(tensor_parallel_ptx PRIVATE USE_NCCL=1)
+endif()
+
+set_target_properties(tensor_parallel_ptx PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
-
-# ── Build Target: TensorParallelPTX (baseline with all kernel variants) ──────
-add_executable(tensor_parallel_ptx ${HOST_SOURCES} ${BASELINE_KERNEL_SOURCES})
-
-# Link CUDA libraries
-foreach(target tensor_parallel_ptx)
-    target_compile_definitions(${target}
-        PRIVATE
-        TP_KERNEL_VARIANT="${KERNEL_VARIANT}"
-    )
-
-    target_link_libraries(${target}
-        PRIVATE
-        cudart
-        cublas
-    )
-    
-    if (HAVE_NCCL)
-        target_include_directories(${target} PRIVATE ${NCCL_INCLUDE_DIR})
-        target_link_libraries(${target} PRIVATE ${NCCL_LIBRARY})
-        target_compile_definitions(${target} PRIVATE USE_NCCL=1)
-    endif()
-    
-    # Set output directory
-    set_target_properties(${target} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-    )
-endforeach()
 
 # ── Build Information ──────────────────────────────────────────────────────
 message(STATUS "========== TensorParallelPTX Build Configuration ==========")

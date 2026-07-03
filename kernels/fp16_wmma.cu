@@ -24,9 +24,14 @@ __global__ void wmma_db(
     const int warp_tile_row = warp_id / WARP_TILES_X;
     const int warp_tile_col = warp_id % WARP_TILES_X;
 
+    // No tail predication: this kernel has no out-of-bounds guard like
+    //   if(tile_row >= local_M || tile_col >= local_N) return;
+    // and the load loops don't clamp either. Such an early return would
+    // deadlock the __syncthreads below (partial blocks: some warps exit,
+    // others wait forever). Instead launch_kernel enforces that
+    // local_M/local_N divide the block tile, so every warp is in-bounds.
     const int tile_row = blockIdx.y * (WMMA_M * WARP_TILES_Y) + warp_tile_row * WMMA_M;
     const int tile_col = blockIdx.x * (WMMA_N * WARP_TILES_X) + warp_tile_col * WMMA_N;
-    if(tile_row >= local_M || tile_col >= local_N) return;
 
     __shared__ __align__(16) half As[2][WARPS_PER_BLOCK][WMMA_M][WMMA_K + PAD];
     __shared__ __align__(16) half Bs[2][WARPS_PER_BLOCK][WMMA_K][WMMA_N + PAD];
@@ -74,6 +79,11 @@ __global__ void wmma_db(
 
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
         asm volatile("cp.async.wait_group 0;");
+        __syncwarp();
+        // you need a __syncwarp() here (as tiles are per-warp so a full syncthreads() isnt required)
+        // as cp.async.wait_group 0 only makes copies visible to the issuing thread 
+        // and load_matrix_sync then reads bytes written by other lanes' cp.asyncs
+        // without __syncwarp() it would be a race
 
         buf = next;
         wmma::load_matrix_sync(a_frag, &As[buf][warp_id][0][0], WMMA_K + PAD);
@@ -91,11 +101,23 @@ __global__ void wmma_db(
 // Called by Solver::run(); one definition per build target.
 void launch_kernel(const half* A, const half* B, float* C,
                    const GemmConfig& cfg, cudaStream_t stream) {
-    // Compute local per-GPU dimensions based on 2D TP configuration
-    int local_M = cfg.M / cfg.tp_rows;
-    int local_N = cfg.N / cfg.tp_cols;
-    int local_K = cfg.K / cfg.tp_cols;
-    
+    // Per-rank GEMM dims are set by the runner (SUMMA / 1D / verify).
+    const int local_M = cfg.local_M;
+    const int local_N = cfg.local_N;
+    const int local_K = cfg.local_K;
+
+    // Kernel has no tail handling: local dims must divide the block/K tile.
+    // Always-on runtime check (not assert): dims come from CLI args, and
+    // assert() vanishes under -DNDEBUG — the failure mode here is a hang.
+    if (local_M % (WMMA_M * WARP_TILES_Y) != 0 ||
+        local_N % (WMMA_N * WARP_TILES_X) != 0 ||
+        local_K % WMMA_K != 0) {
+        fprintf(stderr, "[error] local dims (%d,%d,%d) must be multiples of block tile (%d,%d,%d)\n",
+                local_M, local_N, local_K,
+                WMMA_M * WARP_TILES_Y, WMMA_N * WARP_TILES_X, WMMA_K);
+        exit(1);
+    }
+
     dim3 threads(THREADS_PER_WARP * WARPS_PER_BLOCK);
     dim3 blocks(
         (local_N + WARP_TILES_X * WMMA_N - 1) / (WARP_TILES_X * WMMA_N),

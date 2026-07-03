@@ -1,5 +1,6 @@
 #include "src/app/cli.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -12,9 +13,11 @@ Args parse_args(int argc, char** argv) {
     args.K = DEFAULT_K;
     args.num_batches = DEFAULT_NUM_BATCHES;
     args.chunk_batches = 1;
+    args.tp_mode = TpMode::Summa;
     args.tp_rows = DEFAULT_TP_ROWS;
     args.tp_cols = DEFAULT_TP_COLS;
     args.verify = false;
+    args.verify_tp = true;   // cheap (64 CPU dot products/rank, untimed) — on by default
     args.profile = true;
     args.profile_runs = DEFAULT_PROFILE_RUNS;
     args.walltime_file = "profile_walltime.txt";
@@ -31,7 +34,20 @@ Args parse_args(int argc, char** argv) {
         else if (arg == "--chunk-batches" && i + 1 < argc) args.chunk_batches = atoi(argv[++i]);
         else if (arg == "--tp-rows" && i + 1 < argc) args.tp_rows = atoi(argv[++i]);
         else if (arg == "--tp-cols" && i + 1 < argc) args.tp_cols = atoi(argv[++i]);
+        else if (arg == "--tp-mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "summa") args.tp_mode = TpMode::Summa;
+            else if (m == "1d-col") args.tp_mode = TpMode::OneDCol;
+            else if (m == "1d-row") args.tp_mode = TpMode::OneDRow;
+            else {
+                fprintf(stderr, "[error] unknown --tp-mode '%s' (expected summa | 1d-col | 1d-row)\n", m.c_str());
+                exit(1);
+            }
+        }
+        else if (arg == "--verify") args.verify = true;
         else if (arg == "--no-verify") args.verify = false;
+        else if (arg == "--verify-tp") args.verify_tp = true;
+        else if (arg == "--no-verify-tp") args.verify_tp = false;
         else if (arg == "--no-profile") args.profile = false;
         else if (arg == "--profile-runs" && i + 1 < argc) args.profile_runs = atoi(argv[++i]);
         else if (arg == "--walltime-file" && i + 1 < argc) args.walltime_file = argv[++i];

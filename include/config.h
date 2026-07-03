@@ -34,19 +34,12 @@ constexpr int DEFAULT_PROFILE_RUNS = 5;
 
 // ── Runtime problem / benchmark configuration ────────────────────────────────────
 struct GemmConfig {
-    // Global problem dimensions
+    // Global problem dimensions (informational)
     int M, N, K;
     int num_batches;
-    int warmups, runs;
-    
-    // Tensor Parallelism configuration
-    int tp_rows;    // number of ranks in row dimension (splitting M and A)
-    int tp_cols;    // number of ranks in column dimension (splitting N, B, and K)
-    int gpu_rank;   // global rank (0 to tp_rows*tp_cols - 1)
-    
-    // Derived: local per-GPU dimensions
-    // These are computed from global dims and TP rank:
-    //   local_M = M / tp_rows
-    //   local_N = N / tp_cols
-    //   local_K = K / tp_cols
+
+    // Per-rank GEMM dims — the kernel contract. The runner decides how these
+    // relate to the global dims (SUMMA 2D shards, 1D col/row shards, or 1:1
+    // for single-GPU verify). Kernels are TP-agnostic.
+    int local_M, local_N, local_K;
 };

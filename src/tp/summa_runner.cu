@@ -1,9 +1,16 @@
 #include "src/tp/summa_runner.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+// NVTX v3 (header-only): named ranges for the nsys timeline. nsys projects
+// ranges onto the GPU rows via the kernels/collectives launched inside them,
+// which makes the compute/comm overlap directly visible.
+#include <nvtx3/nvToolsExt.h>
 
 #include "include/config.h"
 #include "include/cuda_utils.h"
@@ -36,6 +43,13 @@ bool validate_runtime(const Args& args, int num_gpus) {
                 "[error] divisibility check failed: require M%%tp_rows==0, N%%tp_cols==0, K%%tp_cols==0. "
                 "Got M=%d N=%d K=%d tp_rows=%d tp_cols=%d\n",
                 args.M, args.N, args.K, args.tp_rows, args.tp_cols);
+        return false;
+    }
+    // SUMMA panel indexing (B K-rows indexed by row coord with lK=K/tp_cols,
+    // panel roots p over tp_cols) is only correct on a square mesh.
+    if (args.tp_cols > 1 && args.tp_rows != args.tp_cols) {
+        fprintf(stderr, "[error] SUMMA path requires a square mesh (tp_rows == tp_cols) when tp_cols > 1. "
+                        "Got %dx%d\n", args.tp_rows, args.tp_cols);
         return false;
     }
 
@@ -150,10 +164,15 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
 
     cudaEvent_t ev_start{}, ev_stop{};
     cudaEvent_t ev_panel_ready_ping{}, ev_panel_ready_pong{};
+    // Reverse handshake: comm must not overwrite a panel buffer before the
+    // compute stream has finished reading it (next chunk / next profile run).
+    cudaEvent_t ev_panel_consumed_ping{}, ev_panel_consumed_pong{};
     CHECK_CUDA(cudaEventCreate(&ev_start));
     CHECK_CUDA(cudaEventCreate(&ev_stop));
     CHECK_CUDA(cudaEventCreate(&ev_panel_ready_ping));
     CHECK_CUDA(cudaEventCreate(&ev_panel_ready_pong));
+    CHECK_CUDA(cudaEventCreate(&ev_panel_consumed_ping));
+    CHECK_CUDA(cudaEventCreate(&ev_panel_consumed_pong));
 
     for (int b = 0; b < B; ++b) {
         half* A_dst = h_A_stage.get() + (size_t)b * szA_l;
@@ -168,10 +187,13 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                                szB_all * sizeof(half), cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
-    CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
+    // One chunk = panel-broadcast loop + GEMM + accumulate. Shared by the
+    // timed profiling loop and the post-timing verify pass.
+    auto run_chunk = [&](int chunk_idx) {
+            char nvtx_name[64];
+            snprintf(nvtx_name, sizeof(nvtx_name), "chunk %d", chunk_idx);
+            nvtxRangePushA(nvtx_name);
 
-    for (int iter = 0; iter < args.profile_runs; ++iter) {
-        for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
             const int batch_start = chunk_idx * eff_chunk_B;
             const int cur_chunk_B = ((batch_start + eff_chunk_B) <= B) ? eff_chunk_B : (B - batch_start);
             const size_t c_chunk_elems = (size_t)cur_chunk_B * szC_l;
@@ -181,11 +203,9 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
             cfg.N = N;
             cfg.K = K;
             cfg.num_batches = cur_chunk_B;
-            cfg.warmups = 0;
-            cfg.runs = 1;
-            cfg.tp_rows = tp_rows;
-            cfg.tp_cols = tp_cols;
-            cfg.gpu_rank = rank;
+            cfg.local_M = local_M;
+            cfg.local_N = local_N;
+            cfg.local_K = local_K;
 
             const half* A_own = d_A.get() + (size_t)batch_start * szA_l;
             const half* B_own = d_B.get() + (size_t)batch_start * szB_l;
@@ -193,6 +213,10 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
 
             if (tp_cols > 1) {
 #ifdef USE_NCCL
+                nvtxRangePushA("bcast p=0 (ping)");
+                // Don't overwrite ping until compute finished reading it
+                // (previous chunk / previous profile run).
+                CHECK_CUDA(cudaStreamWaitEvent(comm_stream, ev_panel_consumed_ping, 0));
                 CHECK_NCCL(ncclBroadcast((const void*)A_own,
                                          (void*)d_A_panel_ping.get(),
                                          (size_t)cur_chunk_B * szA_l,
@@ -208,6 +232,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                                          col_comm,
                                          comm_stream));
                 CHECK_CUDA(cudaEventRecord(ev_panel_ready_ping, comm_stream));
+                nvtxRangePop();
 #endif
             }
 
@@ -228,9 +253,14 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
 
                     const int next_p = p + 1;
                     if (next_p < tp_cols) {
+                        snprintf(nvtx_name, sizeof(nvtx_name), "bcast p=%d (prefetch)", next_p);
+                        nvtxRangePushA(nvtx_name);
                         const int next_buf = next_p & 1;
                         half* A_next = (next_buf == 0) ? d_A_panel_ping.get() : d_A_panel_pong.get();
                         half* B_next = (next_buf == 0) ? d_B_panel_ping.get() : d_B_panel_pong.get();
+                        CHECK_CUDA(cudaStreamWaitEvent(comm_stream,
+                                                       (next_buf == 0) ? ev_panel_consumed_ping : ev_panel_consumed_pong,
+                                                       0));
                         CHECK_NCCL(ncclBroadcast((const void*)A_own,
                                                  (void*)A_next,
                                                  (size_t)cur_chunk_B * szA_l,
@@ -247,21 +277,42 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                                                  comm_stream));
                         CHECK_CUDA(cudaEventRecord((next_buf == 0) ? ev_panel_ready_ping : ev_panel_ready_pong,
                                                    comm_stream));
+                        nvtxRangePop();
                     }
                 }
 #endif
 
+                snprintf(nvtx_name, sizeof(nvtx_name), "gemm p=%d", p);
+                nvtxRangePushA(nvtx_name);
                 CHECK_CUDA(cudaMemsetAsync(C_partial, 0, c_chunk_elems * sizeof(float), compute_stream));
                 launch_kernel(A_panel, B_panel, C_partial, cfg, compute_stream);
+                nvtxRangePop();
+#ifdef USE_NCCL
+                if (tp_cols > 1) {
+                    // Panels are last read by launch_kernel: mark buffer reusable.
+                    CHECK_CUDA(cudaEventRecord((buf == 0) ? ev_panel_consumed_ping : ev_panel_consumed_pong,
+                                               compute_stream));
+                }
+#endif
 
+                snprintf(nvtx_name, sizeof(nvtx_name), "accum p=%d", p);
+                nvtxRangePushA(nvtx_name);
                 constexpr int kAccThreads = 256;
                 const int acc_blocks = (int)((c_chunk_elems + kAccThreads - 1) / kAccThreads);
                 accumulate_inplace<<<acc_blocks, kAccThreads, 0, compute_stream>>>(
                     d_C_accum.get(), C_partial, c_chunk_elems);
                 CHECK_CUDA(cudaGetLastError());
+                nvtxRangePop();
             }
-        }
-    }
+
+            nvtxRangePop(); // chunk
+    };
+
+    CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
+
+    for (int iter = 0; iter < args.profile_runs; ++iter)
+        for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx)
+            run_chunk(chunk_idx);
 
     CHECK_CUDA(cudaEventRecord(ev_stop, compute_stream));
     CHECK_CUDA(cudaEventSynchronize(ev_stop));
@@ -275,6 +326,53 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
            local_M, local_K, local_K, local_N, local_M, local_N,
            local_ms, B);
     fflush(stdout);
+
+    // ── TP correctness check (untimed) ────────────────────────────────────────
+    // Re-run chunk 0 through the full SUMMA path, then sample-check C elements
+    // of batch 0 against CPU dot products over the *global* K (deterministic
+    // generator — no global matrices needed). Catches broadcast-root, panel
+    // ordering, and accumulation bugs end-to-end.
+    // fp16-only: the CPU reference assumes half inputs / float output; int
+    // variants reinterpret these buffers and need their own reference.
+#ifdef TP_KERNEL_VARIANT
+    const bool fp16_variant = strstr(TP_KERNEL_VARIANT, "fp16") != nullptr;
+#else
+    const bool fp16_variant = true;
+#endif
+    if (args.verify_tp && !fp16_variant && rank == 0) {
+        printf("  [verify-tp] skipped: only implemented for fp16 variants\n");
+    }
+    if (args.verify_tp && fp16_variant) {
+        nvtxRangePushA("verify-tp");
+        run_chunk(0);
+        std::vector<float> h_C(szC_l);
+        CHECK_CUDA(cudaMemcpyAsync(h_C.data(), d_C_accum.get(), szC_l * sizeof(float),
+                                   cudaMemcpyDeviceToHost, compute_stream));
+        CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+        constexpr int kSamples = 64;
+        unsigned s = 0x9E3779B9u ^ (unsigned)rank;   // per-rank LCG seed
+        int fails = 0;
+        float max_rel = 0.0f;
+        for (int i = 0; i < kSamples; ++i) {
+            s = s * 1664525u + 1013904223u;
+            const int m = (int)((s >> 8) % (unsigned)local_M);
+            s = s * 1664525u + 1013904223u;
+            const int n = (int)((s >> 8) % (unsigned)local_N);
+            const float ref = cpu_ref_c_value(/*batch=*/0,
+                                              coord.row * local_M + m,
+                                              coord.col * local_N + n, K, N);
+            const float out = h_C[(size_t)m * local_N + n];
+            const float abs_err = fabsf(ref - out);
+            const float rel = abs_err / fmaxf(fabsf(ref), 1e-6f);
+            if (rel > max_rel) max_rel = rel;
+            if (abs_err > 2e-3f * fabsf(ref) + 2e-3f) ++fails;
+        }
+        printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_rel=%.3e)\n",
+               rank, fails == 0 ? "PASS" : "FAIL", kSamples - fails, kSamples, max_rel);
+        fflush(stdout);
+        nvtxRangePop();
+    }
 
     ProfileStats stats{};
     stats.avg_rank_ms = local_ms;
@@ -302,6 +400,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     CHECK_CUDA(cudaEventDestroy(ev_stop));
     CHECK_CUDA(cudaEventDestroy(ev_panel_ready_ping));
     CHECK_CUDA(cudaEventDestroy(ev_panel_ready_pong));
+    CHECK_CUDA(cudaEventDestroy(ev_panel_consumed_ping));
+    CHECK_CUDA(cudaEventDestroy(ev_panel_consumed_pong));
     CHECK_CUDA(cudaStreamDestroy(compute_stream));
     CHECK_CUDA(cudaStreamDestroy(comm_stream));
 

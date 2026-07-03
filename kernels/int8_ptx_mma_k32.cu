@@ -77,9 +77,10 @@ __global__ void int8_ptx_mma_k32_true_db(
     const int warp_tile_row = warp_id / WARP_TILES_X;
     const int warp_tile_col = warp_id % WARP_TILES_X;
 
+    // No tail predication (see fp16_wmma.cu): launch_kernel enforces
+    // divisibility; an early return here would deadlock __syncthreads.
     const int tile_row = blockIdx.y * (WMMA_M * WARP_TILES_Y) + warp_tile_row * WMMA_M;
     const int tile_col = blockIdx.x * (WMMA_N * WARP_TILES_X) + warp_tile_col * WMMA_N;
-    if (tile_row >= local_M || tile_col >= local_N) return;
 
     __shared__ __align__(16) int8_t As[2][WARPS_PER_BLOCK][WMMA_M][WMMA_K + PAD];
     __shared__ __align__(16) int8_t Bs[2][WARPS_PER_BLOCK][WMMA_N][WMMA_K + PAD];
@@ -162,11 +163,21 @@ __global__ void int8_ptx_mma_k32_true_db(
 
 void launch_kernel(const int8_t* A, const int8_t* BT, int32_t* C,
                    const GemmConfig& cfg, cudaStream_t stream) {
-    // Compute local per-GPU dimensions based on 2D TP configuration
-    int local_M = cfg.M / cfg.tp_rows;
-    int local_N = cfg.N / cfg.tp_cols;
-    int local_K = cfg.K / cfg.tp_cols;
-    
+    // Per-rank GEMM dims are set by the runner (SUMMA / 1D / verify).
+    const int local_M = cfg.local_M;
+    const int local_N = cfg.local_N;
+    const int local_K = cfg.local_K;
+
+    // Kernel has no tail handling: local dims must divide the block/K tile.
+    if (local_M % (WMMA_M * WARP_TILES_Y) != 0 ||
+        local_N % (WMMA_N * WARP_TILES_X) != 0 ||
+        local_K % WMMA_K != 0) {
+        fprintf(stderr, "[error] local dims (%d,%d,%d) must be multiples of block tile (%d,%d,%d)\n",
+                local_M, local_N, local_K,
+                WMMA_M * WARP_TILES_Y, WMMA_N * WARP_TILES_X, WMMA_K);
+        exit(1);
+    }
+
     dim3 threads(THREADS_PER_WARP * WARPS_PER_BLOCK);
     dim3 blocks(
         (local_N + WARP_TILES_X * WMMA_N - 1) / (WARP_TILES_X * WMMA_N),

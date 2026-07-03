@@ -26,6 +26,24 @@ int query_num_gpus() {
     return n;
 }
 
+void print_p2p_topology(int num_gpus) {
+    printf("\n--- GPU topology (P2P access matrix) ---\n     ");
+    for (int j = 0; j < num_gpus; ++j) printf("GPU%d ", j);
+    printf("\n");
+    for (int i = 0; i < num_gpus; ++i) {
+        printf("GPU%d ", i);
+        for (int j = 0; j < num_gpus; ++j) {
+            if (i == j) { printf("   . "); continue; }
+            int can = 0;
+            CHECK_CUDA(cudaDeviceCanAccessPeer(&can, i, j));
+            printf("   %c ", can ? 'Y' : '-');
+        }
+        printf("\n");
+    }
+    printf("'-' = no P2P: NCCL stages traffic through host/PCIe.\n");
+    printf("Also try: nvidia-smi topo -m   and   NCCL_DEBUG=INFO <run> (shows ring construction)\n");
+}
+
 DistContext resolve_dist_context(const Args& args, int num_ranks, int num_gpus) {
     DistContext dc{};
     dc.enabled = false;
