@@ -42,73 +42,105 @@ Two TP strategies share the same kernels (`--tp-mode`): **SUMMA** (2D, comm on i
 Cheapest failures first. Stop at any FAIL. Approx cost of the whole playbook: ~20–30 min on 4×L4.
 (No NCU here: per-kernel profiling was already done single-GPU and the kernels are unchanged under TP — nsys is where all the new TP information lives.)
 
-```bash
+```zsh
 # ── 0. Environment check (free) ──────────────────────────────────────────────
 nvcc --version && nsys --version
 nvidia-smi topo -m          # compare against the P2P matrix the binary prints
 which torchrun || pip install torch --index-url https://download.pytorch.org/whl/cu121
 
-VARIANTS="fp16_wmma int8_wmma int8_ptx_mma_k32 int4_wmma int4_ptx_mma_k64_x4_x2nontrans_ca"
+VARIANTS=(
+  fp16_wmma
+  int8_wmma
+  int8_ptx_mma_k32
+  int4_wmma
+  int4_ptx_mma_k64_x4_x2nontrans_ca
+)
 ```
 
-```bash
+```zsh
 # ── 1. Compile all variants (~5 min, catches all build trivia at once) ───────
-for K in $VARIANTS; do
-  echo "=== build $K ===" && cmake -DKERNEL_VARIANT=$K -S . -B build > /dev/null \
-    && cmake --build build -j > /dev/null || { echo "BUILD FAIL: $K"; break; }
+for K in "${VARIANTS[@]}"; do
+  echo "=== build $K ==="
+  cmake -DKERNEL_VARIANT="$K" -S . -B "builds/$K" >/dev/null &&
+    cmake --build "builds/$K" -j >/dev/null ||
+    { echo "BUILD FAIL: $K"; break; }
 done
 ```
 
-```bash
-# ── 2. Kernel correctness, single GPU (expect 2x PASS per variant) ───────────
-for K in $VARIANTS; do
-  echo "=== verify $K ===" && cmake -DKERNEL_VARIANT=$K -S . -B build > /dev/null \
-    && cmake --build build -j > /dev/null
-  ./build/bin/tensor_parallel_ptx --tp-rows 1 --tp-cols 1 --verify --no-profile
+```zsh
+# ── 2. Kernel correctness, single GPU (baseline PASS for every variant) ──────
+# FP16/INT8 also check cuBLAS; INT4 reports cuBLAS skipped (unsupported).
+for K in "${VARIANTS[@]}"; do
+  echo "=== verify $K ==="
+  cmake -DKERNEL_VARIANT="$K" -S . -B "builds/$K" >/dev/null &&
+    cmake --build "builds/$K" -j >/dev/null &&
+    "./builds/$K/bin/tensor_parallel_ptx" \
+      --tp-rows 1 --tp-cols 1 --verify --no-profile ||
+    { echo "VERIFY FAIL: $K"; break; }
 done
 ```
 
-```bash
+```zsh
 # ── 3. TP correctness, 4 GPUs, all three modes (expect verify-tp PASS x4 ranks each) ─
-cmake -DKERNEL_VARIANT=fp16_wmma -S . -B build > /dev/null && cmake --build build -j > /dev/null
-RUN4="torchrun --standalone --nproc_per_node=4 --no-python ./build/bin/tensor_parallel_ptx \
-  --M 4096 --N 4096 --K 4096 --B 1 --profile-runs 1"
-$RUN4 --tp-rows 2 --tp-cols 2                          # summa
-$RUN4 --tp-mode 1d-row --tp-rows 1 --tp-cols 4         # allreduce C
-$RUN4 --tp-mode 1d-col --tp-rows 1 --tp-cols 4         # allgather C
+if cmake -DKERNEL_VARIANT=fp16_wmma -S . -B builds/fp16_wmma >/dev/null &&
+   cmake --build builds/fp16_wmma -j >/dev/null; then
+  RUN4=(
+    torchrun --standalone --nproc_per_node=4 --no-python
+    ./builds/fp16_wmma/bin/tensor_parallel_ptx
+    --M 4096 --N 4096 --K 4096 --B 1 --profile-runs 1
+  )
+  "${RUN4[@]}" --tp-rows 2 --tp-cols 2 &&                    # summa
+    "${RUN4[@]}" --tp-mode 1d-row --tp-rows 1 --tp-cols 4 && # allreduce C
+    "${RUN4[@]}" --tp-mode 1d-col --tp-rows 1 --tp-cols 4 || # allgather C
+    echo "TP VERIFY FAIL"
+else
+  echo "BUILD FAIL: fp16_wmma"
+fi
 ```
 
-```bash
+```zsh
 # ── 4. NSYS, big shape: all 5 kernels on SUMMA 2x2 (~2-3 min each) ───────────
-for K in $VARIANTS; do
-  OUT=prof/nsys/$K && mkdir -p $OUT
-  cmake -DKERNEL_VARIANT=$K -S . -B build > /dev/null && cmake --build build -j > /dev/null
+for K in "${VARIANTS[@]}"; do
+  OUT="prof/nsys/$K"
+  mkdir -p "$OUT"
+  cmake -DKERNEL_VARIANT="$K" -S . -B "builds/$K" >/dev/null &&
+    cmake --build "builds/$K" -j >/dev/null ||
+    { echo "BUILD FAIL: $K"; break; }
   nsys profile --force-overwrite true --trace cuda,nvtx,osrt --sample=none --cuda-memory-usage=true \
-    -o $OUT/nsys_$K \
-    torchrun --standalone --nproc_per_node=4 --no-python ./build/bin/tensor_parallel_ptx \
+    -o "$OUT/nsys_$K" \
+    torchrun --standalone --nproc_per_node=4 --no-python "./builds/$K/bin/tensor_parallel_ptx" \
     --M 16384 --N 16384 --K 16384 --tp-rows 2 --tp-cols 2 --B 4 --chunk-batches 1 --profile-runs 2 \
-    --walltime-file $OUT/walltime_$K.txt
+    --walltime-file "$OUT/walltime_$K.txt" ||
+    { echo "PROFILE FAIL: $K"; break; }
   nsys stats --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
-    $OUT/nsys_$K.nsys-rep > $OUT/nsys_${K}_summary.txt
+    "$OUT/nsys_$K.nsys-rep" >"$OUT/nsys_${K}_summary.txt" ||
+    { echo "STATS FAIL: $K"; break; }
 done
 ```
 
-```bash
+```zsh
 # ── 5. NSYS, big shape: fp16 on the 1D modes (SUMMA-vs-1D comparison data) ───
-cmake -DKERNEL_VARIANT=fp16_wmma -S . -B build > /dev/null && cmake --build build -j > /dev/null
-for MODE in 1d-row 1d-col; do
-  OUT=prof/nsys/fp16_wmma_$MODE && mkdir -p $OUT
-  nsys profile --force-overwrite true --trace cuda,nvtx,osrt --sample=none --cuda-memory-usage=true \
-    -o $OUT/nsys_fp16_$MODE \
-    torchrun --standalone --nproc_per_node=4 --no-python ./build/bin/tensor_parallel_ptx \
-    --M 16384 --N 16384 --K 16384 --tp-mode $MODE --tp-rows 1 --tp-cols 4 --B 4 --profile-runs 2 \
-    --walltime-file $OUT/walltime_fp16_$MODE.txt
-  nsys stats --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
-    $OUT/nsys_fp16_$MODE.nsys-rep > $OUT/nsys_fp16_${MODE}_summary.txt
-done
+if cmake -DKERNEL_VARIANT=fp16_wmma -S . -B builds/fp16_wmma >/dev/null &&
+   cmake --build builds/fp16_wmma -j >/dev/null; then
+  for MODE in 1d-row 1d-col; do
+    OUT="prof/nsys/fp16_wmma_$MODE"
+    mkdir -p "$OUT"
+    nsys profile --force-overwrite true --trace cuda,nvtx,osrt --sample=none --cuda-memory-usage=true \
+      -o "$OUT/nsys_fp16_$MODE" \
+      torchrun --standalone --nproc_per_node=4 --no-python ./builds/fp16_wmma/bin/tensor_parallel_ptx \
+      --M 16384 --N 16384 --K 16384 --tp-mode "$MODE" --tp-rows 1 --tp-cols 4 --B 4 --profile-runs 2 \
+      --walltime-file "$OUT/walltime_fp16_$MODE.txt" ||
+      { echo "PROFILE FAIL: fp16_wmma_$MODE"; break; }
+    nsys stats --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
+      "$OUT/nsys_fp16_$MODE.nsys-rep" >"$OUT/nsys_fp16_${MODE}_summary.txt" ||
+      { echo "STATS FAIL: fp16_wmma_$MODE"; break; }
+  done
+else
+  echo "BUILD FAIL: fp16_wmma"
+fi
 ```
 
-```bash
+```zsh
 # ── 6. Collect results ────────────────────────────────────────────────────────
 cat prof/nsys/*/walltime_*.txt          # one line per run: kernel, mode, shape, ms
 ls -la prof/nsys/*/                     # .nsys-rep for the GUI, .txt summaries
