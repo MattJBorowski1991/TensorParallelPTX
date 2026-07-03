@@ -1,0 +1,3 @@
+2026-07-03 22:05:27 kernel=fp16_wmma mode=summa M=4096 N=4096 K=4096 B=1 tp=2x2 runs=1 avg_rank_ms=81.968 wall_ms=89.773
+2026-07-03 22:05:33 kernel=fp16_wmma mode=1d-row M=4096 N=4096 K=4096 B=1 tp=1x4 runs=1 avg_rank_ms=59.501 wall_ms=60.452
+2026-07-03 22:05:38 kernel=fp16_wmma mode=1d-col M=4096 N=4096 K=4096 B=1 tp=1x4 runs=1 avg_rank_ms=66.176 wall_ms=80.058

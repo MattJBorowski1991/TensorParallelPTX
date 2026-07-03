@@ -22,7 +22,28 @@
 void launch_kernel(const half* A, const half* B, float* C,
                    const GemmConfig& cfg, cudaStream_t stream);
 
+static TpDataKind selected_data_kind() {
+#ifdef TP_KERNEL_VARIANT
+    if (strstr(TP_KERNEL_VARIANT, "int4") != nullptr) return TpDataKind::Int4;
+    if (strstr(TP_KERNEL_VARIANT, "int8") != nullptr) return TpDataKind::Int8;
+#endif
+    return TpDataKind::Fp16;
+}
+
+static size_t input_storage_bytes(size_t logical_elements, TpDataKind kind) {
+    if (kind == TpDataKind::Fp16) return logical_elements * sizeof(half);
+    if (kind == TpDataKind::Int8) return logical_elements * sizeof(int8_t);
+    return logical_elements / 2; // packed signed INT4
+}
+
 __global__ void accumulate_inplace(float* dst, const float* src, size_t n) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] += src[idx];
+    }
+}
+
+__global__ void accumulate_inplace_int32(int32_t* dst, const int32_t* src, size_t n) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         dst[idx] += src[idx];
@@ -52,6 +73,12 @@ bool validate_runtime(const Args& args, int num_gpus) {
                         "Got %dx%d\n", args.tp_rows, args.tp_cols);
         return false;
     }
+    const TpDataKind kind = selected_data_kind();
+    const int local_K = args.K / args.tp_cols;
+    if (kind == TpDataKind::Int4 && (args.K % 2 != 0 || local_K % 2 != 0)) {
+        fprintf(stderr, "[error] INT4 SUMMA requires even global and local K dimensions.\n");
+        return false;
+    }
 
     const int num_ranks = args.tp_rows * args.tp_cols;
     if (num_gpus < num_ranks) {
@@ -78,6 +105,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     const int num_gpus = query_num_gpus();
     const int M = args.M, N = args.N, K = args.K;
     const int B = args.num_batches;
+    const TpDataKind data_kind = selected_data_kind();
+    const bool integer_output = data_kind != TpDataKind::Fp16;
     const int local_M = M / tp_rows;
     const int local_N = N / tp_cols;
     const int local_K = K / tp_cols;
@@ -93,8 +122,10 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     size_t szA_l = (size_t)local_M * local_K;
     size_t szB_l = (size_t)local_K * local_N;
     size_t szC_l = (size_t)local_M * local_N;
-    size_t szA_all = (size_t)B * szA_l;
-    size_t szB_all = (size_t)B * szB_l;
+    size_t bytesA_l = input_storage_bytes(szA_l, data_kind);
+    size_t bytesB_l = input_storage_bytes(szB_l, data_kind);
+    size_t bytesA_all = (size_t)B * bytesA_l;
+    size_t bytesB_all = (size_t)B * bytesB_l;
     size_t szC_chunk_max = (size_t)eff_chunk_B * szC_l;
 
     const int rank = dist.rank;
@@ -145,14 +176,14 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     }
 #endif
 
-    PinnedBuffer<half> h_A_stage(szA_all);
-    PinnedBuffer<half> h_B_stage(szB_all);
-    DeviceBuffer<half> d_A(szA_all);
-    DeviceBuffer<half> d_B(szB_all);
-    DeviceBuffer<half> d_A_panel_ping((size_t)eff_chunk_B * szA_l);
-    DeviceBuffer<half> d_A_panel_pong((size_t)eff_chunk_B * szA_l);
-    DeviceBuffer<half> d_B_panel_ping((size_t)eff_chunk_B * szB_l);
-    DeviceBuffer<half> d_B_panel_pong((size_t)eff_chunk_B * szB_l);
+    PinnedBuffer<uint8_t> h_A_stage(bytesA_all);
+    PinnedBuffer<uint8_t> h_B_stage(bytesB_all);
+    DeviceBuffer<uint8_t> d_A(bytesA_all);
+    DeviceBuffer<uint8_t> d_B(bytesB_all);
+    DeviceBuffer<uint8_t> d_A_panel_ping((size_t)eff_chunk_B * bytesA_l);
+    DeviceBuffer<uint8_t> d_A_panel_pong((size_t)eff_chunk_B * bytesA_l);
+    DeviceBuffer<uint8_t> d_B_panel_ping((size_t)eff_chunk_B * bytesB_l);
+    DeviceBuffer<uint8_t> d_B_panel_pong((size_t)eff_chunk_B * bytesB_l);
     DeviceBuffer<float> d_C_accum(szC_chunk_max);
     DeviceBuffer<float> d_C_partial_ping(szC_chunk_max);
     DeviceBuffer<float> d_C_partial_pong(szC_chunk_max);
@@ -175,16 +206,16 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     CHECK_CUDA(cudaEventCreate(&ev_panel_consumed_pong));
 
     for (int b = 0; b < B; ++b) {
-        half* A_dst = h_A_stage.get() + (size_t)b * szA_l;
-        half* B_dst = h_B_stage.get() + (size_t)b * szB_l;
-        fill_rank_batch_shards(A_dst, B_dst,
-                               M, N, K, local_M, local_N, local_K, b, coord);
+        void* A_dst = h_A_stage.get() + (size_t)b * bytesA_l;
+        void* B_dst = h_B_stage.get() + (size_t)b * bytesB_l;
+        fill_rank_batch_shards_typed(
+            A_dst, B_dst, M, N, K, local_M, local_N, local_K, b, coord, data_kind);
     }
 
     CHECK_CUDA(cudaMemcpyAsync(d_A.get(), h_A_stage.get(),
-                               szA_all * sizeof(half), cudaMemcpyHostToDevice, compute_stream));
+                               bytesA_all, cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaMemcpyAsync(d_B.get(), h_B_stage.get(),
-                               szB_all * sizeof(half), cudaMemcpyHostToDevice, compute_stream));
+                               bytesB_all, cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
     // One chunk = panel-broadcast loop + GEMM + accumulate. Shared by the
@@ -197,6 +228,15 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
             const int batch_start = chunk_idx * eff_chunk_B;
             const int cur_chunk_B = ((batch_start + eff_chunk_B) <= B) ? eff_chunk_B : (B - batch_start);
             const size_t c_chunk_elems = (size_t)cur_chunk_B * szC_l;
+            const size_t a_bcast_count = (size_t)cur_chunk_B *
+                (data_kind == TpDataKind::Fp16 ? szA_l : bytesA_l);
+            const size_t b_bcast_count = (size_t)cur_chunk_B *
+                (data_kind == TpDataKind::Fp16 ? szB_l : bytesB_l);
+#ifdef USE_NCCL
+            const ncclDataType_t input_nccl_type =
+                data_kind == TpDataKind::Fp16 ? ncclHalf :
+                data_kind == TpDataKind::Int8 ? ncclInt8 : ncclUint8;
+#endif
 
             GemmConfig cfg{};
             cfg.M = M;
@@ -207,8 +247,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
             cfg.local_N = local_N;
             cfg.local_K = local_K;
 
-            const half* A_own = d_A.get() + (size_t)batch_start * szA_l;
-            const half* B_own = d_B.get() + (size_t)batch_start * szB_l;
+            const uint8_t* A_own = d_A.get() + (size_t)batch_start * bytesA_l;
+            const uint8_t* B_own = d_B.get() + (size_t)batch_start * bytesB_l;
             CHECK_CUDA(cudaMemsetAsync(d_C_accum.get(), 0, c_chunk_elems * sizeof(float), compute_stream));
 
             if (tp_cols > 1) {
@@ -219,15 +259,15 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                 CHECK_CUDA(cudaStreamWaitEvent(comm_stream, ev_panel_consumed_ping, 0));
                 CHECK_NCCL(ncclBroadcast((const void*)A_own,
                                          (void*)d_A_panel_ping.get(),
-                                         (size_t)cur_chunk_B * szA_l,
-                                         ncclHalf,
+                                         a_bcast_count,
+                                         input_nccl_type,
                                          0,
                                          row_comm,
                                          comm_stream));
                 CHECK_NCCL(ncclBroadcast((const void*)B_own,
                                          (void*)d_B_panel_ping.get(),
-                                         (size_t)cur_chunk_B * szB_l,
-                                         ncclHalf,
+                                         b_bcast_count,
+                                         input_nccl_type,
                                          0,
                                          col_comm,
                                          comm_stream));
@@ -238,8 +278,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
 
             for (int p = 0; p < tp_cols; ++p) {
                 const int buf = p & 1;
-                const half* A_panel = A_own;
-                const half* B_panel = B_own;
+                const uint8_t* A_panel = A_own;
+                const uint8_t* B_panel = B_own;
                 float* C_partial = (buf == 0) ? d_C_partial_ping.get() : d_C_partial_pong.get();
 
 #ifdef USE_NCCL
@@ -256,22 +296,22 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                         snprintf(nvtx_name, sizeof(nvtx_name), "bcast p=%d (prefetch)", next_p);
                         nvtxRangePushA(nvtx_name);
                         const int next_buf = next_p & 1;
-                        half* A_next = (next_buf == 0) ? d_A_panel_ping.get() : d_A_panel_pong.get();
-                        half* B_next = (next_buf == 0) ? d_B_panel_ping.get() : d_B_panel_pong.get();
+                        uint8_t* A_next = (next_buf == 0) ? d_A_panel_ping.get() : d_A_panel_pong.get();
+                        uint8_t* B_next = (next_buf == 0) ? d_B_panel_ping.get() : d_B_panel_pong.get();
                         CHECK_CUDA(cudaStreamWaitEvent(comm_stream,
                                                        (next_buf == 0) ? ev_panel_consumed_ping : ev_panel_consumed_pong,
                                                        0));
                         CHECK_NCCL(ncclBroadcast((const void*)A_own,
                                                  (void*)A_next,
-                                                 (size_t)cur_chunk_B * szA_l,
-                                                 ncclHalf,
+                                                 a_bcast_count,
+                                                 input_nccl_type,
                                                  next_p,
                                                  row_comm,
                                                  comm_stream));
                         CHECK_NCCL(ncclBroadcast((const void*)B_own,
                                                  (void*)B_next,
-                                                 (size_t)cur_chunk_B * szB_l,
-                                                 ncclHalf,
+                                                 b_bcast_count,
+                                                 input_nccl_type,
                                                  next_p,
                                                  col_comm,
                                                  comm_stream));
@@ -285,7 +325,9 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                 snprintf(nvtx_name, sizeof(nvtx_name), "gemm p=%d", p);
                 nvtxRangePushA(nvtx_name);
                 CHECK_CUDA(cudaMemsetAsync(C_partial, 0, c_chunk_elems * sizeof(float), compute_stream));
-                launch_kernel(A_panel, B_panel, C_partial, cfg, compute_stream);
+                launch_kernel(reinterpret_cast<const half*>(A_panel),
+                              reinterpret_cast<const half*>(B_panel),
+                              C_partial, cfg, compute_stream);
                 nvtxRangePop();
 #ifdef USE_NCCL
                 if (tp_cols > 1) {
@@ -299,8 +341,14 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                 nvtxRangePushA(nvtx_name);
                 constexpr int kAccThreads = 256;
                 const int acc_blocks = (int)((c_chunk_elems + kAccThreads - 1) / kAccThreads);
-                accumulate_inplace<<<acc_blocks, kAccThreads, 0, compute_stream>>>(
-                    d_C_accum.get(), C_partial, c_chunk_elems);
+                if (integer_output) {
+                    accumulate_inplace_int32<<<acc_blocks, kAccThreads, 0, compute_stream>>>(
+                        reinterpret_cast<int32_t*>(d_C_accum.get()),
+                        reinterpret_cast<const int32_t*>(C_partial), c_chunk_elems);
+                } else {
+                    accumulate_inplace<<<acc_blocks, kAccThreads, 0, compute_stream>>>(
+                        d_C_accum.get(), C_partial, c_chunk_elems);
+                }
                 CHECK_CUDA(cudaGetLastError());
                 nvtxRangePop();
             }
@@ -327,49 +375,70 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
            local_ms, B);
     fflush(stdout);
 
-    // ── TP correctness check (untimed) ────────────────────────────────────────
-    // Re-run chunk 0 through the full SUMMA path, then sample-check C elements
-    // of batch 0 against CPU dot products over the *global* K (deterministic
-    // generator — no global matrices needed). Catches broadcast-root, panel
-    // ordering, and accumulation bugs end-to-end.
-    // fp16-only: the CPU reference assumes half inputs / float output; int
-    // variants reinterpret these buffers and need their own reference.
-#ifdef TP_KERNEL_VARIANT
-    const bool fp16_variant = strstr(TP_KERNEL_VARIANT, "fp16") != nullptr;
-#else
-    const bool fp16_variant = true;
-#endif
-    if (args.verify_tp && !fp16_variant && rank == 0) {
-        printf("  [verify-tp] skipped: only implemented for fp16 variants\n");
-    }
-    if (args.verify_tp && fp16_variant) {
+    // ── TP correctness check (untimed, all kernel storage variants) ──────────
+    // Re-run chunk 0 through the complete panel-broadcast and accumulation path,
+    // then compare sampled local C elements against full-global-K CPU dots.
+    if (args.verify_tp) {
         nvtxRangePushA("verify-tp");
         run_chunk(0);
-        std::vector<float> h_C(szC_l);
-        CHECK_CUDA(cudaMemcpyAsync(h_C.data(), d_C_accum.get(), szC_l * sizeof(float),
-                                   cudaMemcpyDeviceToHost, compute_stream));
-        CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
         constexpr int kSamples = 64;
-        unsigned s = 0x9E3779B9u ^ (unsigned)rank;   // per-rank LCG seed
+        unsigned s = 0x9E3779B9u ^ (unsigned)rank;
         int fails = 0;
         float max_rel = 0.0f;
-        for (int i = 0; i < kSamples; ++i) {
-            s = s * 1664525u + 1013904223u;
-            const int m = (int)((s >> 8) % (unsigned)local_M);
-            s = s * 1664525u + 1013904223u;
-            const int n = (int)((s >> 8) % (unsigned)local_N);
-            const float ref = cpu_ref_c_value(/*batch=*/0,
-                                              coord.row * local_M + m,
-                                              coord.col * local_N + n, K, N);
-            const float out = h_C[(size_t)m * local_N + n];
-            const float abs_err = fabsf(ref - out);
-            const float rel = abs_err / fmaxf(fabsf(ref), 1e-6f);
-            if (rel > max_rel) max_rel = rel;
-            if (abs_err > 2e-3f * fabsf(ref) + 2e-3f) ++fails;
+        int32_t max_abs_int = 0;
+
+        if (integer_output) {
+            std::vector<int32_t> h_C(szC_l);
+            CHECK_CUDA(cudaMemcpyAsync(h_C.data(), d_C_accum.get(),
+                                       szC_l * sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, compute_stream));
+            CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+            for (int i = 0; i < kSamples; ++i) {
+                s = s * 1664525u + 1013904223u;
+                const int m = (int)((s >> 8) % (unsigned)local_M);
+                s = s * 1664525u + 1013904223u;
+                const int n = (int)((s >> 8) % (unsigned)local_N);
+                const int gm = coord.row * local_M + m;
+                const int gn = coord.col * local_N + n;
+                const int32_t ref = cpu_ref_c_value_int(0, gm, gn, K, N, data_kind);
+                const int32_t out = h_C[(size_t)m * local_N + n];
+                const int64_t diff = (int64_t)ref - out;
+                const int32_t abs_err = (int32_t)(diff < 0 ? -diff : diff);
+                if (abs_err > max_abs_int) max_abs_int = abs_err;
+                if (abs_err != 0) ++fails;
+            }
+        } else {
+            std::vector<float> h_C(szC_l);
+            CHECK_CUDA(cudaMemcpyAsync(h_C.data(), d_C_accum.get(),
+                                       szC_l * sizeof(float),
+                                       cudaMemcpyDeviceToHost, compute_stream));
+            CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+            for (int i = 0; i < kSamples; ++i) {
+                s = s * 1664525u + 1013904223u;
+                const int m = (int)((s >> 8) % (unsigned)local_M);
+                s = s * 1664525u + 1013904223u;
+                const int n = (int)((s >> 8) % (unsigned)local_N);
+                const float ref = cpu_ref_c_value(0,
+                                                  coord.row * local_M + m,
+                                                  coord.col * local_N + n, K, N);
+                const float out = h_C[(size_t)m * local_N + n];
+                const float abs_err = fabsf(ref - out);
+                const float rel = abs_err / fmaxf(fabsf(ref), 1e-6f);
+                if (rel > max_rel) max_rel = rel;
+                if (abs_err > 2e-3f * fabsf(ref) + 2e-3f) ++fails;
+            }
         }
-        printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_rel=%.3e)\n",
-               rank, fails == 0 ? "PASS" : "FAIL", kSamples - fails, kSamples, max_rel);
+
+        if (integer_output) {
+            printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_abs=%d)\n",
+                   rank, fails == 0 ? "PASS" : "FAIL",
+                   kSamples - fails, kSamples, (int)max_abs_int);
+        } else {
+            printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_rel=%.3e)\n",
+                   rank, fails == 0 ? "PASS" : "FAIL",
+                   kSamples - fails, kSamples, max_rel);
+        }
         fflush(stdout);
         nvtxRangePop();
     }

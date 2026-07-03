@@ -3,7 +3,7 @@
 #include <string>
 
 // How the GEMM is distributed across ranks.
-//   Summa  — 2D mesh, SUMMA panel broadcasts of A/B (comm on inputs, fp16)
+//   Summa  — 2D mesh, typed SUMMA panel broadcasts of A/B (comm on inputs)
 //   OneDCol — Megatron column-parallel: A replicated, B split by N;
 //             allgather of C shards (comm on output, optional)
 //   OneDRow — Megatron row-parallel: A/B split by K; each rank computes a
@@ -29,7 +29,7 @@ struct Args {
     int tp_rows;
     int tp_cols;
     bool verify;      // single-GPU kernel verify vs cached CPU reference (rank 0)
-    bool verify_tp;   // sampled end-to-end SUMMA verify on every rank (untimed)
+    bool verify_tp;   // sampled end-to-end TP verify on every rank (untimed)
     bool profile;
     int profile_runs;
     std::string walltime_file;

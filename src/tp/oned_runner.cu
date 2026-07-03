@@ -38,7 +38,21 @@
 void launch_kernel(const half* A, const half* B, float* C,
                    const GemmConfig& cfg, cudaStream_t stream);
 
-static bool validate_runtime_1d(const Args& args, int num_gpus) {
+static TpDataKind selected_data_kind() {
+#ifdef TP_KERNEL_VARIANT
+    if (strstr(TP_KERNEL_VARIANT, "int4") != nullptr) return TpDataKind::Int4;
+    if (strstr(TP_KERNEL_VARIANT, "int8") != nullptr) return TpDataKind::Int8;
+#endif
+    return TpDataKind::Fp16;
+}
+
+static size_t input_storage_bytes(size_t logical_elements, TpDataKind kind) {
+    if (kind == TpDataKind::Fp16) return logical_elements * sizeof(half);
+    if (kind == TpDataKind::Int8) return logical_elements * sizeof(int8_t);
+    return logical_elements / 2; // packed signed INT4
+}
+
+static bool validate_runtime_1d(const Args& args, int num_gpus, TpDataKind kind) {
     if (args.M <= 0 || args.N <= 0 || args.K <= 0 || args.num_batches <= 0 || args.profile_runs <= 0) {
         fprintf(stderr, "[error] M/N/K, num_batches, and profile_runs must be > 0.\n");
         return false;
@@ -55,6 +69,11 @@ static bool validate_runtime_1d(const Args& args, int num_gpus) {
     }
     if (args.tp_mode == TpMode::OneDRow && args.K % P != 0) {
         fprintf(stderr, "[error] 1d-row requires K %% P == 0 (K=%d P=%d).\n", args.K, P);
+        return false;
+    }
+    if (kind == TpDataKind::Int4 &&
+        (args.K % 2 != 0 || (args.tp_mode == TpMode::OneDRow && (args.K / P) % 2 != 0))) {
+        fprintf(stderr, "[error] INT4 1D TP requires even global and local K dimensions.\n");
         return false;
     }
     if (num_gpus < P) {
@@ -75,13 +94,15 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     const bool col_mode = (args.tp_mode == TpMode::OneDCol);
     const int M = args.M, N = args.N, K = args.K;
     const int B = args.num_batches;
+    const TpDataKind data_kind = selected_data_kind();
+    const bool integer_output = data_kind != TpDataKind::Fp16;
 
     // Per-rank GEMM dims per mode (see header comment).
     const int local_M = M;
     const int local_N = col_mode ? N / P : N;
     const int local_K = col_mode ? K : K / P;
 
-    if (!validate_runtime_1d(args, query_num_gpus())) return {};
+    if (!validate_runtime_1d(args, query_num_gpus(), data_kind)) return {};
     const int chunk_B = args.chunk_batches > 0 ? args.chunk_batches : 1;
     if (chunk_B > B) {
         fprintf(stderr, "[warn] chunk-batches (%d) > B (%d), clamping to B.\n", chunk_B, B);
@@ -92,6 +113,8 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     const size_t szA_l = (size_t)local_M * local_K;
     const size_t szB_l = (size_t)local_K * local_N;
     const size_t szC_l = (size_t)local_M * local_N;
+    const size_t bytesA_l = input_storage_bytes(szA_l, data_kind);
+    const size_t bytesB_l = input_storage_bytes(szB_l, data_kind);
     const size_t szC_chunk_max = (size_t)eff_chunk_B * szC_l;
 
     const int rank = dist.rank;
@@ -112,10 +135,10 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     }
 #endif
 
-    PinnedBuffer<half> h_A_stage((size_t)B * szA_l);
-    PinnedBuffer<half> h_B_stage((size_t)B * szB_l);
-    DeviceBuffer<half> d_A((size_t)B * szA_l);
-    DeviceBuffer<half> d_B((size_t)B * szB_l);
+    PinnedBuffer<uint8_t> h_A_stage((size_t)B * bytesA_l);
+    PinnedBuffer<uint8_t> h_B_stage((size_t)B * bytesB_l);
+    DeviceBuffer<uint8_t> d_A((size_t)B * bytesA_l);
+    DeviceBuffer<uint8_t> d_B((size_t)B * bytesB_l);
     // Double-buffered GEMM output: collective on buffer `b` overlaps the next
     // chunk's GEMM into buffer `1-b`.
     DeviceBuffer<float> d_C_ping(szC_chunk_max);
@@ -138,16 +161,21 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     }
 
     for (int b = 0; b < B; ++b) {
-        half* A_dst = h_A_stage.get() + (size_t)b * szA_l;
-        half* B_dst = h_B_stage.get() + (size_t)b * szB_l;
-        if (col_mode) fill_rank_batch_shards_1d_col(A_dst, B_dst, M, N, K, local_N, b, rank);
-        else          fill_rank_batch_shards_1d_row(A_dst, B_dst, M, N, K, local_K, b, rank);
+        void* A_dst = h_A_stage.get() + (size_t)b * bytesA_l;
+        void* B_dst = h_B_stage.get() + (size_t)b * bytesB_l;
+        if (col_mode) {
+            fill_rank_batch_shards_1d_col_typed(
+                A_dst, B_dst, M, N, K, local_N, b, rank, data_kind);
+        } else {
+            fill_rank_batch_shards_1d_row_typed(
+                A_dst, B_dst, M, N, K, local_K, b, rank, data_kind);
+        }
     }
 
     CHECK_CUDA(cudaMemcpyAsync(d_A.get(), h_A_stage.get(),
-                               (size_t)B * szA_l * sizeof(half), cudaMemcpyHostToDevice, compute_stream));
+                               (size_t)B * bytesA_l, cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaMemcpyAsync(d_B.get(), h_B_stage.get(),
-                               (size_t)B * szB_l * sizeof(half), cudaMemcpyHostToDevice, compute_stream));
+                               (size_t)B * bytesB_l, cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
     // One chunk = GEMM into C[buf] + collective on C[buf]. `pass` alternates
@@ -173,8 +201,8 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
         cfg.local_N = local_N;
         cfg.local_K = local_K;
 
-        const half* A_own = d_A.get() + (size_t)batch_start * szA_l;
-        const half* B_own = d_B.get() + (size_t)batch_start * szB_l;
+        const uint8_t* A_own = d_A.get() + (size_t)batch_start * bytesA_l;
+        const uint8_t* B_own = d_B.get() + (size_t)batch_start * bytesB_l;
         float* C_out = (buf == 0) ? d_C_ping.get() : d_C_pong.get();
 
         // Wait until the collective from two chunks ago released this buffer.
@@ -182,7 +210,9 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
         CHECK_CUDA(cudaStreamWaitEvent(compute_stream, ev_c_free[buf], 0));
 
         nvtxRangePushA("gemm");
-        launch_kernel(A_own, B_own, C_out, cfg, compute_stream);
+        launch_kernel(reinterpret_cast<const half*>(A_own),
+                      reinterpret_cast<const half*>(B_own),
+                      C_out, cfg, compute_stream);
         nvtxRangePop();
         CHECK_CUDA(cudaEventRecord(ev_c_ready[buf], compute_stream));
 
@@ -193,13 +223,13 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
                 nvtxRangePushA("allgather C");
                 CHECK_NCCL(ncclAllGather((const void*)C_out,
                                          (void*)d_C_gathered.get(),
-                                         c_chunk_elems, ncclFloat,
+                                         c_chunk_elems, integer_output ? ncclInt32 : ncclFloat,
                                          world_comm, comm_stream));
             } else {
                 nvtxRangePushA("allreduce C");
                 // In-place: sums the P partial C's; the collective IS the accumulation.
                 CHECK_NCCL(ncclAllReduce((const void*)C_out, (void*)C_out,
-                                         c_chunk_elems, ncclFloat, ncclSum,
+                                         c_chunk_elems, integer_output ? ncclInt32 : ncclFloat, ncclSum,
                                          world_comm, comm_stream));
             }
             nvtxRangePop();
@@ -231,20 +261,9 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
            local_ms, B);
     fflush(stdout);
 
-    // ── TP correctness check (untimed, fp16 variants only) ───────────────────
-    // 1d-col: check the local C shard (pre-gather) — sample (m, n) maps to
-    //         global (m, rank*lN + n). Gather correctness is NCCL's contract.
-    // 1d-row: check C AFTER the allreduce — the sum over all K slices is the
-    //         whole point; samples map 1:1 to global (m, n).
-#ifdef TP_KERNEL_VARIANT
-    const bool fp16_variant = strstr(TP_KERNEL_VARIANT, "fp16") != nullptr;
-#else
-    const bool fp16_variant = true;
-#endif
-    if (args.verify_tp && !fp16_variant && rank == 0) {
-        printf("  [verify-tp] skipped: only implemented for fp16 variants\n");
-    }
-    if (args.verify_tp && fp16_variant) {
+    // ── TP correctness check (untimed, all kernel storage variants) ──────────
+    // 1d-col checks the local C shard; 1d-row checks C after allreduce.
+    if (args.verify_tp) {
         nvtxRangePushA("verify-tp");
         const int vbuf = pass & 1;   // buffer run_chunk(0) will use next
         run_chunk(0);
@@ -252,31 +271,57 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
         CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
         float* C_check = (vbuf == 0) ? d_C_ping.get() : d_C_pong.get();
-        std::vector<float> h_C(szC_l);
-        CHECK_CUDA(cudaMemcpy(h_C.data(), C_check, szC_l * sizeof(float), cudaMemcpyDeviceToHost));
-
         constexpr int kSamples = 64;
         unsigned s = 0x9E3779B9u ^ (unsigned)rank;
         int fails = 0;
         float max_rel = 0.0f;
-        for (int i = 0; i < kSamples; ++i) {
-            s = s * 1664525u + 1013904223u;
-            const int m = (int)((s >> 8) % (unsigned)local_M);
-            s = s * 1664525u + 1013904223u;
-            const int n = (int)((s >> 8) % (unsigned)local_N);
-            const int gm = m;
-            const int gn = col_mode ? rank * local_N + n : n;
-            // 1d-row with P==1 degenerates to the full GEMM; with P>1 the
-            // reference is still the full-K dot product (post-allreduce C).
-            const float ref = cpu_ref_c_value(/*batch=*/0, gm, gn, K, N);
-            const float out = h_C[(size_t)m * local_N + n];
-            const float abs_err = fabsf(ref - out);
-            const float rel = abs_err / fmaxf(fabsf(ref), 1e-6f);
-            if (rel > max_rel) max_rel = rel;
-            if (abs_err > 2e-3f * fabsf(ref) + 2e-3f) ++fails;
+        int32_t max_abs_int = 0;
+
+        if (integer_output) {
+            std::vector<int32_t> h_C(szC_l);
+            CHECK_CUDA(cudaMemcpy(h_C.data(), C_check,
+                                  szC_l * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < kSamples; ++i) {
+                s = s * 1664525u + 1013904223u;
+                const int m = (int)((s >> 8) % (unsigned)local_M);
+                s = s * 1664525u + 1013904223u;
+                const int n = (int)((s >> 8) % (unsigned)local_N);
+                const int gn = col_mode ? rank * local_N + n : n;
+                const int32_t ref = cpu_ref_c_value_int(0, m, gn, K, N, data_kind);
+                const int32_t out = h_C[(size_t)m * local_N + n];
+                const int64_t diff = (int64_t)ref - out;
+                const int32_t abs_err = (int32_t)(diff < 0 ? -diff : diff);
+                if (abs_err > max_abs_int) max_abs_int = abs_err;
+                if (abs_err != 0) ++fails;
+            }
+        } else {
+            std::vector<float> h_C(szC_l);
+            CHECK_CUDA(cudaMemcpy(h_C.data(), C_check,
+                                  szC_l * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < kSamples; ++i) {
+                s = s * 1664525u + 1013904223u;
+                const int m = (int)((s >> 8) % (unsigned)local_M);
+                s = s * 1664525u + 1013904223u;
+                const int n = (int)((s >> 8) % (unsigned)local_N);
+                const int gn = col_mode ? rank * local_N + n : n;
+                const float ref = cpu_ref_c_value(0, m, gn, K, N);
+                const float out = h_C[(size_t)m * local_N + n];
+                const float abs_err = fabsf(ref - out);
+                const float rel = abs_err / fmaxf(fabsf(ref), 1e-6f);
+                if (rel > max_rel) max_rel = rel;
+                if (abs_err > 2e-3f * fabsf(ref) + 2e-3f) ++fails;
+            }
         }
-        printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_rel=%.3e)\n",
-               rank, fails == 0 ? "PASS" : "FAIL", kSamples - fails, kSamples, max_rel);
+
+        if (integer_output) {
+            printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_abs=%d)\n",
+                   rank, fails == 0 ? "PASS" : "FAIL",
+                   kSamples - fails, kSamples, (int)max_abs_int);
+        } else {
+            printf("  rank %d [verify-tp] %s  (%d/%d samples ok, max_rel=%.3e)\n",
+                   rank, fails == 0 ? "PASS" : "FAIL",
+                   kSamples - fails, kSamples, max_rel);
+        }
         fflush(stdout);
         nvtxRangePop();
     }

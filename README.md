@@ -41,7 +41,7 @@ One process per GPU (`WORLD_SIZE == tp_rows * tp_cols`); `RANK`/`LOCAL_RANK` com
 | `--tp-mode` | `summa` | `summa` (2D panel broadcasts) \| `1d-col` (allgather C) \| `1d-row` (allreduce C); 1D modes need `--tp-rows 1`, P = `--tp-cols` |
 | `--profile-runs` | 5 | timed iterations |
 | `--verify` | off | rank 0: single-GPU 1024³ kernel vs cached CPU ref + cuBLAS |
-| `--verify-tp` / `--no-verify-tp` | on | untimed end-to-end SUMMA sample check (fp16 variants; auto-skips for int) |
+| `--verify-tp` / `--no-verify-tp` | on | untimed end-to-end TP sample check for every mode and kernel variant |
 | `--walltime-file` | `profile_walltime.txt` | append wall-time log (rank 0) |
 
 ## Build
@@ -70,6 +70,24 @@ torchrun --standalone --nproc_per_node=4 --no-python ./build/bin/tensor_parallel
 ```
 
 ## Profile
+
+### Wall-time comparison (4×L4)
+
+Critical-path wall time (`wall_ms`) for `M=N=K=16384`, `B=4`, and two
+profile runs. SUMMA uses a 2×2 mesh; the 1D modes use a 1×4 group. These
+measurements include Nsight Systems instrumentation overhead.
+
+| Kernel | SUMMA 2×2 | 1D row 1×4 | 1D col 1×4 | Fastest |
+|---|---:|---:|---:|---|
+| `fp16_wmma` | **3038.494 ms** | 3466.801 ms | 3139.312 ms | SUMMA |
+| `int8_wmma` | **1432.520 ms** | 1818.683 ms | 1556.154 ms | SUMMA |
+| `int8_ptx_mma_k32` | 1015.542 ms | 2110.969 ms | **981.308 ms** | 1D col |
+| `int4_wmma` | **823.104 ms** | 1401.107 ms | 1128.168 ms | SUMMA |
+| `int4_ptx_mma_k64_x4_x2nontrans_ca` | **315.784 ms** | 1213.218 ms | 791.391 ms | SUMMA |
+
+SUMMA is fastest for four of the five kernels. The 1D-row path is slowest
+throughout because it all-reduces the full 32-bit output, while 1D-col uses
+the smaller all-gather.
 
 ### Nsight Systems (timeline: kernels + NCCL + streams; use the big shape)
 

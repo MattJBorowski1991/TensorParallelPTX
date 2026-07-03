@@ -1,26 +1,26 @@
-# Current State (fp16 path)
+# Current State
 
 Two TP strategies share the same kernels (`--tp-mode`): **SUMMA** (2D, comm on inputs) and **1D Megatron-style** (comm on output). Kernels are TP-agnostic — they receive `local_M/N/K` via `GemmConfig` and don't know the distribution.
 
 ## How tensor parallel is implemented (SUMMA, default)
 - **Mesh**: 2D `tp_rows × tp_cols` (default 2×2), one host process per GPU (torchrun-style env vars). Square mesh required when `tp_cols > 1`.
-- **Shards**: rank `(i,j)` owns `A[lM×lK]`, `B[lK×lN]`, `C[lM×lN]` with `lM=M/tp_rows`, `lN=N/tp_cols`, `lK=K/tp_cols`. Shards are generated out-of-core from a deterministic hash — no global matrices ever materialized.
-- **SUMMA loop**: per chunk, `tp_cols` panel steps. Step `p`: NCCL broadcasts A panel across the row communicator (root `col=p`) and B panel down the column communicator (root `row=p`); kernel computes the partial GEMM; `accumulate_inplace` sums into `C_accum`.
+- **Shards**: rank `(i,j)` owns `A[lM×lK]`, `B[lK×lN]`, `C[lM×lN]` with `lM=M/tp_rows`, `lN=N/tp_cols`, `lK=K/tp_cols`. Storage is dtype-aware: FP16, INT8, or packed INT4 inputs with FP32/INT32 outputs; integer B shards use the kernels’ transposed layout. Shards are generated directly from a deterministic hash.
+- **SUMMA loop**: per chunk, `tp_cols` panel steps. Step `p`: NCCL broadcasts native representations (`ncclHalf` elements, `ncclInt8` elements, or packed-INT4 bytes via `ncclUint8`); the selected kernel computes a partial GEMM; FP32 or INT32 accumulation sums into `C_accum`.
 - **Overlap**: two streams per rank (comm + compute), ping/pong panel buffers, event handshake in **both** directions: `panel_ready` (comm→compute) and `panel_consumed` (compute→comm, prevents overwrite of a buffer still being read).
-- **Kernel**: WMMA m16n16k16, 8 warps/block (64×32 block tile), one 16×16 output tile per warp, per-warp smem tiles, `cp.async` double-buffered K-loop (`__syncwarp` after `wait_group` for cross-lane visibility).
+- **Kernels**: the same FP16, INT8, and INT4 WMMA/PTX variants run unchanged under each TP strategy; runners supply dtype-correct buffers and local dimensions.
 
 ## 1D TP (`--tp-mode 1d-col | 1d-row`, `src/tp/oned_runner.cu`)
-- Flat mesh: `--tp-rows 1 --tp-cols P`. Isolated runner; reuses NCCL bootstrap, streams/events, verify-tp patterns.
+- Flat mesh: `--tp-rows 1 --tp-cols P`. Supports every compiled kernel variant with dtype-aware shards: FP16 inputs/FP32 outputs, INT8 inputs/INT32 outputs, and packed INT4 inputs/INT32 outputs.
 - **1d-col** (column-parallel): A replicated (regenerated locally — free with the deterministic generator), B split by N. GEMM needs no comm; `ncclAllGather` materializes full C. Real transformers skip the gather by pairing with a row-parallel layer.
 - **1d-row** (row-parallel): A/B split by K. Each rank computes a full-size *partial* C; `ncclAllReduce` sums them — the collective is the accumulation (no `accumulate_inplace` kernel).
 - Overlap: C double-buffered; collective for chunk *c* on `comm_stream` overlaps GEMM of chunk *c+1* on `compute_stream` (`c_ready`/`c_free` event handshake).
-- Comm volume vs SUMMA (P=4, 16384³, per rank per chunk): SUMMA receives ~512 MB fp16 inputs; 1d-row moves ~1.5 GB fp32 C (ring allreduce ≈ 2·(P−1)/P · size); 1d-col gathers ~0.75 GB — or **zero** if C stays sharded.
+- Comm volume (P=4, 16384³, per rank per chunk): FP16 SUMMA moves roughly 0.5 GiB of inputs (half for INT8, one quarter for INT4); 1d-row moves ~1.5 GiB of 32-bit C, while 1d-col gathers ~0.75 GiB — or **zero** if C stays sharded.
 
 ## Correctness checks
 - `--verify` (rank 0, off by default): single-GPU 1024³ kernel run vs **two references**:
   - cached CPU GEMM (exact for int8/int4, fp32-accumulated for fp16);
   - **cuBLAS GemmEx** on GPU (fp16: fp32 accumulate; int8: exact int32; int4: no cuBLAS support — CPU reference is authoritative).
-- `--verify-tp` (on by default, untimed, fp16 variants only): re-runs chunk 0 through the full SUMMA path, then each rank checks 64 sampled C elements against CPU dot products over the global K (recomputed from the deterministic generator). Catches broadcast-root, panel-order, and accumulation bugs end-to-end. Disable with `--no-verify-tp` if a capture must contain only the timed loop.
+- `--verify-tp` (on by default, untimed): re-runs chunk 0 and checks 64 sampled C elements per rank against deterministic CPU dot products for every TP mode and kernel variant. INT8/INT4 checks are exact. Disable with `--no-verify-tp` for profiling-only captures.
 
 ## Last measured (before fixes)
 16384³, B=4, 2×2, L4: avg_rank 1447 ms ≈ 6.1 TFLOPS/rank ≈ **5% of L4 fp16 tensor peak**.
@@ -33,7 +33,6 @@ Two TP strategies share the same kernels (`--tp-mode`): **SUMMA** (2D, comm on i
 5. **Comms**: finer-grained panel sub-tiling to overlap broadcast with GEMM within a step; NVLink/P2P topology-aware communicators.
 6. **Non-square meshes** — B K-split is indexed by row coord with `lK=K/tp_cols`, so only square meshes work today.
 7. **cuBLAS perf roofline** — the cuBLAS reference now checks correctness; also timing it would give a realistic per-GPU target to chase (~85–95% of peak).
-8. **`--verify-tp` for int variants** — profile-path buffers are fp16-typed/filled; int kernels reinterpret them, so the TP check is skipped there. Needs int shard generation + int reference.
 
 ---
 
@@ -81,21 +80,26 @@ done
 ```
 
 ```zsh
-# ── 3. TP correctness, 4 GPUs, all three modes (expect verify-tp PASS x4 ranks each) ─
-if cmake -DKERNEL_VARIANT=fp16_wmma -S . -B builds/fp16_wmma >/dev/null &&
-   cmake --build builds/fp16_wmma -j >/dev/null; then
+# ── 3. TP correctness, 4 GPUs, every kernel in all three modes ───────────────
+for K in "${VARIANTS[@]}"; do
+  cmake -DKERNEL_VARIANT="$K" -S . -B "builds/$K" >/dev/null &&
+    cmake --build "builds/$K" -j >/dev/null ||
+    { echo "BUILD FAIL: $K"; break; }
+
   RUN4=(
     torchrun --standalone --nproc_per_node=4 --no-python
-    ./builds/fp16_wmma/bin/tensor_parallel_ptx
+    "./builds/$K/bin/tensor_parallel_ptx"
     --M 4096 --N 4096 --K 4096 --B 1 --profile-runs 1
+    --walltime-file /tmp/tpptx_verify_tp.txt
   )
-  "${RUN4[@]}" --tp-rows 2 --tp-cols 2 &&                    # summa
-    "${RUN4[@]}" --tp-mode 1d-row --tp-rows 1 --tp-cols 4 && # allreduce C
-    "${RUN4[@]}" --tp-mode 1d-col --tp-rows 1 --tp-cols 4 || # allgather C
-    echo "TP VERIFY FAIL"
-else
-  echo "BUILD FAIL: fp16_wmma"
-fi
+  echo "=== verify SUMMA $K ==="
+  "${RUN4[@]}" --tp-rows 2 --tp-cols 2 &&
+    echo "=== verify 1d-row $K ===" &&
+    "${RUN4[@]}" --tp-mode 1d-row --tp-rows 1 --tp-cols 4 &&
+    echo "=== verify 1d-col $K ===" &&
+    "${RUN4[@]}" --tp-mode 1d-col --tp-rows 1 --tp-cols 4 ||
+    { echo "TP RUN FAIL: $K"; break; }
+done
 ```
 
 ```zsh
@@ -109,35 +113,38 @@ for K in "${VARIANTS[@]}"; do
   nsys profile --force-overwrite true --trace cuda,nvtx,osrt --sample=none --cuda-memory-usage=true \
     -o "$OUT/nsys_$K" \
     torchrun --standalone --nproc_per_node=4 --no-python "./builds/$K/bin/tensor_parallel_ptx" \
-    --M 16384 --N 16384 --K 16384 --tp-rows 2 --tp-cols 2 --B 4 --chunk-batches 1 --profile-runs 2 \
+    --M 16384 --N 16384 --K 16384 --tp-rows 2 --tp-cols 2 --B 4 --chunk-batches 1 \
+    --profile-runs 2 --no-verify-tp \
     --walltime-file "$OUT/walltime_$K.txt" ||
     { echo "PROFILE FAIL: $K"; break; }
-  nsys stats --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
+  nsys stats --force-export=true --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
     "$OUT/nsys_$K.nsys-rep" >"$OUT/nsys_${K}_summary.txt" ||
     { echo "STATS FAIL: $K"; break; }
 done
 ```
 
 ```zsh
-# ── 5. NSYS, big shape: fp16 on the 1D modes (SUMMA-vs-1D comparison data) ───
-if cmake -DKERNEL_VARIANT=fp16_wmma -S . -B builds/fp16_wmma >/dev/null &&
-   cmake --build builds/fp16_wmma -j >/dev/null; then
+# ── 5. NSYS, big shape: all kernels on both 1D modes ─────────────────────────
+for K in "${VARIANTS[@]}"; do
+  cmake -DKERNEL_VARIANT="$K" -S . -B "builds/$K" >/dev/null &&
+    cmake --build "builds/$K" -j >/dev/null ||
+    { echo "BUILD FAIL: $K"; break; }
+
   for MODE in 1d-row 1d-col; do
-    OUT="prof/nsys/fp16_wmma_$MODE"
+    OUT="prof/nsys/${K}_${MODE}"
     mkdir -p "$OUT"
     nsys profile --force-overwrite true --trace cuda,nvtx,osrt --sample=none --cuda-memory-usage=true \
-      -o "$OUT/nsys_fp16_$MODE" \
-      torchrun --standalone --nproc_per_node=4 --no-python ./builds/fp16_wmma/bin/tensor_parallel_ptx \
-      --M 16384 --N 16384 --K 16384 --tp-mode "$MODE" --tp-rows 1 --tp-cols 4 --B 4 --profile-runs 2 \
-      --walltime-file "$OUT/walltime_fp16_$MODE.txt" ||
-      { echo "PROFILE FAIL: fp16_wmma_$MODE"; break; }
-    nsys stats --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
-      "$OUT/nsys_fp16_$MODE.nsys-rep" >"$OUT/nsys_fp16_${MODE}_summary.txt" ||
-      { echo "STATS FAIL: fp16_wmma_$MODE"; break; }
+      -o "$OUT/nsys_${K}_${MODE}" \
+      torchrun --standalone --nproc_per_node=4 --no-python "./builds/$K/bin/tensor_parallel_ptx" \
+      --M 16384 --N 16384 --K 16384 --tp-mode "$MODE" --tp-rows 1 --tp-cols 4 \
+      --B 4 --profile-runs 2 --no-verify-tp \
+      --walltime-file "$OUT/walltime_${K}_${MODE}.txt" ||
+      { echo "PROFILE FAIL: ${K}_${MODE}"; break 2; }
+    nsys stats --force-export=true --report cuda_api_gpu_sum,cuda_gpu_kern_sum,nvtx_sum --format table \
+      "$OUT/nsys_${K}_${MODE}.nsys-rep" >"$OUT/nsys_${K}_${MODE}_summary.txt" ||
+      { echo "STATS FAIL: ${K}_${MODE}"; break 2; }
   done
-else
-  echo "BUILD FAIL: fp16_wmma"
-fi
+done
 ```
 
 ```zsh

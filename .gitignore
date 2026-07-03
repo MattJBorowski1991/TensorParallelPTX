@@ -33,6 +33,7 @@ ncu_*.txt
 ncu_*.csv
 
 # Nsight Systems artifacts
+/prof/nsys/
 *.nsys-rep
 *.qdstrm
 *.sqlite

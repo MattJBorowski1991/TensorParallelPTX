@@ -1,1 +1,0 @@
-2026-06-02 18:36:56 kernel=int8_wmma M=16384 N=16384 K=16384 B=4 tp=2x2 runs=2 avg_rank_ms=742.182 wall_ms=761.638
