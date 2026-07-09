@@ -1,3 +1,17 @@
+// heart of the SUMMA path
+// TLDR:
+// Take rank (i,j) on a 2×2 mesh and turns it into a timed, verified distributed GEMM.
+// Each rank repeatedly receives the panels it doesn't own, multiplies, and accumulates 
+// — with communication and compute on separate streams so they overlap.
+//
+// NTLDR:
+// 1. SETUP at the NCCL block — 3 communicators, file-based bootstrap, plus what each comm is for (row→A panels, col→B panels, world→timing stats)
+// Buffer allocation — what each buffer's role is (own shards / panel landing zones / C_partial vs C_accum)
+// Streams + the two-direction event handshake ("ready" vs "consumed")
+// 2. DATA at the shard fill + one-time upload
+// 3. run_chunk — THE ALGORITHM above the lambda, with the per-step comm/compute choreography; two inline comments inside mark the pipeline kick-off broadcast and the ping/pong panel loop
+// 4. TIMED LOOP, 5. VERIFY-TP, 6. STATS (with why max = critical path) at their blocks
+
 #include "src/tp/summa_runner.h"
 
 #include <cmath>
@@ -50,6 +64,8 @@ __global__ void accumulate_inplace_int32(int32_t* dst, const int32_t* src, size_
     }
 }
 
+// Sanity: divisibility, square mesh, enough GPUs, NCCL present
+
 bool validate_runtime(const Args& args, int num_gpus) {
     if (args.M <= 0 || args.N <= 0 || args.K <= 0 || args.num_batches <= 0 || args.profile_runs <= 0) {
         fprintf(stderr, "[error] M/N/K, num_batches, and profile_runs must be > 0.\n");
@@ -87,7 +103,9 @@ bool validate_runtime(const Args& args, int num_gpus) {
                 num_ranks, num_gpus);
         return false;
     }
-
+// NCCL (NVIDIA Collective Communications Library) is NVIDIA's library 
+// for fast GPU-to-GPU communication — broadcast, allreduce, allgather, etc.
+// that automatically routes data over the best available path (NVLink, PCIe, network)
 #ifndef USE_NCCL
     if (args.tp_cols > 1) {
         fprintf(stderr, "[error] tp_cols > 1 requires NCCL build support (USE_NCCL).\n");
@@ -98,6 +116,10 @@ bool validate_runtime(const Args& args, int num_gpus) {
     return true;
 }
 
+// run_profile (and in fact the whole binary) runs once per rank
+// torchrun starts 4 identical processes/ranks; each runs main() → run_profile() 
+// top to bottom with only dist.rank differing. So every line you read in this 
+// file is executing (tp_rows x tp_cols = ) 4× in parallel, once per GPU 
 ProfileStats run_profile(const Args& args, const DistContext& dist) {
     const int tp_rows = args.tp_rows;
     const int tp_cols = args.tp_cols;
@@ -134,6 +156,20 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
 
     CHECK_CUDA(cudaSetDevice(device));
 
+    // ── 1. SETUP ──────────────────────────────────────────────────────────────
+
+    // NCCL: create 3 communicators* — world, my-row, my-column.
+    // *communicator = named group of ranks, over which NCCL calls run (eg ncclAllReduce)
+
+    // Bootstrap: to form a communicator, every rank must present the same ncclUniqueId 
+    // (a ~128-byte token that identifies the group being formed)
+    // Rank0 of each group writes the ncclUniqueId to a file, the others poll-read it 
+    // (thats all the nccl_utils.cu does)
+    // (ranks cant yet send it to each other over NCCL as NCCL isnt yet setup)
+    // (actual frameworks use MPI for this)
+    // Row comm  → broadcasts A panels across my mesh row.
+    // Col comm  → broadcasts B panels down my mesh column.
+    // World comm → only used at the end to average/max the timings.
 #ifdef USE_NCCL
     ncclComm_t world_comm = nullptr;
     ncclComm_t row_comm = nullptr;
@@ -176,10 +212,27 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     }
 #endif
 
+    // Allocate: my own A/B shards (all batches), ping/pong panel receive
+    // buffers (the "other ranks' panels" landing zone), and C buffers
+    // (C_partial = one panel step's output, C_accum = running sum).
     PinnedBuffer<uint8_t> h_A_stage(bytesA_all);
     PinnedBuffer<uint8_t> h_B_stage(bytesB_all);
     DeviceBuffer<uint8_t> d_A(bytesA_all);
     DeviceBuffer<uint8_t> d_B(bytesB_all);
+    // PINGPONG (double buffering):
+    // overlapping comm with compute
+    // comm stream:    [bcast p0 panels → PING][bcast p1 panels (A01,B10) → PONG]
+    // compute stream:                         [ GEMM reads PING: A00·B00       ][ GEMM reads PONG: A01·B10 ]
+    //                                          ▲ while this GEMM runs, p1's data is already arriving
+    // where p0/p1 = whose turn it is to share
+    // e.g. p=0 means: in every row, the member sitting at column 0 shares its A; in every column, the member sitting at row 0 shares its B.
+    // to be more precise:
+    // i.  p=0: sharers are: A = rank00, rank10; B = rank00, rank01
+    // ii. p=1: sharers are: A = rank01, rank11; B = rank10, rank11
+    // limited advantage here as we only have 4 GPUs and hence there will be 1 single overlap
+    // but with a larger number of GPUs this would be v advantageous
+
+    //without pingpong we would have: bcast -> GEMM -> wait for bcast -> GEMM (serial)
     DeviceBuffer<uint8_t> d_A_panel_ping((size_t)eff_chunk_B * bytesA_l);
     DeviceBuffer<uint8_t> d_A_panel_pong((size_t)eff_chunk_B * bytesA_l);
     DeviceBuffer<uint8_t> d_B_panel_ping((size_t)eff_chunk_B * bytesB_l);
@@ -188,6 +241,9 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     DeviceBuffer<float> d_C_partial_ping(szC_chunk_max);
     DeviceBuffer<float> d_C_partial_pong(szC_chunk_max);
 
+    // Two streams so communication and compute can overlap, plus handshake
+    // events in both directions: "panel ready" (comm→compute: safe to read)
+    // and "panel consumed" (compute→comm: safe to overwrite).
     cudaStream_t compute_stream{};
     cudaStream_t comm_stream{};
     CHECK_CUDA(cudaStreamCreate(&compute_stream));
@@ -205,6 +261,13 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     CHECK_CUDA(cudaEventCreate(&ev_panel_consumed_ping));
     CHECK_CUDA(cudaEventCreate(&ev_panel_consumed_pong));
 
+    // ── 2. DATA ───────────────────────────────────────────────────────────────
+    // Purpose: get all input data resident on the GPU before the timed loop, 
+    // so the benchmark measures GEMM + NCCL only — never host→device transfers 
+    // or data generation.
+
+    // Fill my A/B shards (sharding.cu, deterministic hash) into pinned host
+    // memory, then upload to the GPU once — inputs never move again.
     for (int b = 0; b < B; ++b) {
         void* A_dst = h_A_stage.get() + (size_t)b * bytesA_l;
         void* B_dst = h_B_stage.get() + (size_t)b * bytesB_l;
@@ -218,13 +281,21 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                                bytesB_all, cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
+    // ── 3. run_chunk — THE ALGORITHM ──────────────────────────────────────────
     // One chunk = panel-broadcast loop + GEMM + accumulate. Shared by the
-    // timed profiling loop and the post-timing verify pass.
+    // timed profiling loop (4) and the post-timing verify pass (5).
+    // For each panel step p = 0..tp_cols-1:
+    //   comm stream:    broadcast A panel (row comm, root col=p) and
+    //                   B panel (col comm, root row=p) — prefetched into the
+    //                   ping/pong buffer for step p+1 while step p computes
+    //   compute stream: wait "panel ready" → GEMM → C_partial
+    //                   → accumulate C_partial into C_accum
     auto run_chunk = [&](int chunk_idx) {
             char nvtx_name[64];
             snprintf(nvtx_name, sizeof(nvtx_name), "chunk %d", chunk_idx);
             nvtxRangePushA(nvtx_name);
 
+            // Which batches this chunk covers (last chunk may be smaller).
             const int batch_start = chunk_idx * eff_chunk_B;
             const int cur_chunk_B = ((batch_start + eff_chunk_B) <= B) ? eff_chunk_B : (B - batch_start);
             const size_t c_chunk_elems = (size_t)cur_chunk_B * szC_l;
@@ -238,6 +309,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                 data_kind == TpDataKind::Int8 ? ncclInt8 : ncclUint8;
 #endif
 
+            // Kernel launch config: global dims + this rank's local GEMM dims.
             GemmConfig cfg{};
             cfg.M = M;
             cfg.N = N;
@@ -247,23 +319,26 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
             cfg.local_N = local_N;
             cfg.local_K = local_K;
 
+            // My own shard slice for this chunk's batches (what I send when I'm root).
             const uint8_t* A_own = d_A.get() + (size_t)batch_start * bytesA_l;
             const uint8_t* B_own = d_B.get() + (size_t)batch_start * bytesB_l;
+            // Zero the running sum: C_accum will collect all panel steps' partials.
             CHECK_CUDA(cudaMemsetAsync(d_C_accum.get(), 0, c_chunk_elems * sizeof(float), compute_stream));
 
+            // Kick off the pipeline: broadcast step 0's panels into ping.
             if (tp_cols > 1) {
 #ifdef USE_NCCL
                 nvtxRangePushA("bcast p=0 (ping)");
                 // Don't overwrite ping until compute finished reading it
                 // (previous chunk / previous profile run).
                 CHECK_CUDA(cudaStreamWaitEvent(comm_stream, ev_panel_consumed_ping, 0));
-                CHECK_NCCL(ncclBroadcast((const void*)A_own,
-                                         (void*)d_A_panel_ping.get(),
-                                         a_bcast_count,
-                                         input_nccl_type,
-                                         0,
-                                         row_comm,
-                                         comm_stream));
+                CHECK_NCCL(ncclBroadcast((const void*)A_own, // send buffer (every rank calls this with its own A_own!!!)
+                                         (void*)d_A_panel_ping.get(), //receive buffer - where the panel lands (ping or pong) on every rank
+                                         a_bcast_count, // number of elements to transfer
+                                         input_nccl_type, // element type (ncclHalf / ncclInt8 / ncclUint8 for packed int4)
+                                         0, // root: WHICH rank in this communicator is the sender (its index within the row comm = mesh column)
+                                         row_comm, // the group: my row's 2 ranks — defines who participates
+                                         comm_stream)); // // CUDA stream the transfer is enqueued on (the comm stream, so it overlaps compute)
                 CHECK_NCCL(ncclBroadcast((const void*)B_own,
                                          (void*)d_B_panel_ping.get(),
                                          b_bcast_count,
@@ -276,21 +351,29 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
 #endif
             }
 
+            // Panel loop: compute step p from one buffer while the comm
+            // stream prefetches step p+1 into the other (ping/pong).
             for (int p = 0; p < tp_cols; ++p) {
+                // Even steps read ping, odd steps read pong.
                 const int buf = p & 1;
+                // Defaults for the no-TP case: compute directly from my own shards.
                 const uint8_t* A_panel = A_own;
                 const uint8_t* B_panel = B_own;
                 float* C_partial = (buf == 0) ? d_C_partial_ping.get() : d_C_partial_pong.get();
 
 #ifdef USE_NCCL
                 if (tp_cols > 1) {
+                    // Block compute until this step's panels have fully arrived.
                     CHECK_CUDA(cudaStreamWaitEvent(compute_stream,
                                                    (buf == 0) ? ev_panel_ready_ping : ev_panel_ready_pong,
                                                    0));
 
+                    // Compute from the received panels instead of my own shards.
                     A_panel = (buf == 0) ? d_A_panel_ping.get() : d_A_panel_pong.get();
                     B_panel = (buf == 0) ? d_B_panel_ping.get() : d_B_panel_pong.get();
 
+                    // Prefetch: broadcast step p+1's panels into the OTHER buffer
+                    // (on comm stream) while this step's GEMM runs below.
                     const int next_p = p + 1;
                     if (next_p < tp_cols) {
                         snprintf(nvtx_name, sizeof(nvtx_name), "bcast p=%d (prefetch)", next_p);
@@ -315,6 +398,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                                                  next_p,
                                                  col_comm,
                                                  comm_stream));
+                        // Signal compute: next step's panels are complete.
                         CHECK_CUDA(cudaEventRecord((next_buf == 0) ? ev_panel_ready_ping : ev_panel_ready_pong,
                                                    comm_stream));
                         nvtxRangePop();
@@ -322,6 +406,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                 }
 #endif
 
+                // GEMM: C_partial = A_panel · B_panel (this step's product).
                 snprintf(nvtx_name, sizeof(nvtx_name), "gemm p=%d", p);
                 nvtxRangePushA(nvtx_name);
                 CHECK_CUDA(cudaMemsetAsync(C_partial, 0, c_chunk_elems * sizeof(float), compute_stream));
@@ -337,6 +422,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
                 }
 #endif
 
+                // Accumulate: C_accum += C_partial (sums the tp_cols panel steps).
                 snprintf(nvtx_name, sizeof(nvtx_name), "accum p=%d", p);
                 nvtxRangePushA(nvtx_name);
                 constexpr int kAccThreads = 256;
@@ -356,6 +442,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
             nvtxRangePop(); // chunk
     };
 
+    // ── 4. TIMED LOOP ─────────────────────────────────────────────────────────
+    // profile_runs × chunks × run_chunk(), bracketed by cuda events → ms.
     CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
 
     for (int iter = 0; iter < args.profile_runs; ++iter)
@@ -375,9 +463,10 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
            local_ms, B);
     fflush(stdout);
 
-    // ── TP correctness check (untimed, all kernel storage variants) ──────────
+    // ── 5. VERIFY-TP (untimed, all kernel storage variants) ──────────────────
     // Re-run chunk 0 through the complete panel-broadcast and accumulation path,
-    // then compare sampled local C elements against full-global-K CPU dots.
+    // then compare 64 sampled local C elements against full-global-K CPU dots
+    // recomputed from the hash generator (sharding.cu).
     if (args.verify_tp) {
         nvtxRangePushA("verify-tp");
         run_chunk(0);
@@ -443,6 +532,9 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
         nvtxRangePop();
     }
 
+    // ── 6. STATS ──────────────────────────────────────────────────────────────
+    // Allreduce the per-rank times over the world comm → avg across ranks and
+    // max (= critical path, the number that matters for wall time).
     ProfileStats stats{};
     stats.avg_rank_ms = local_ms;
     stats.wall_ms = local_ms;

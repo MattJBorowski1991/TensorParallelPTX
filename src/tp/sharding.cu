@@ -1,7 +1,16 @@
-#include "src/tp/sharding.h"
+// ── Purpose of this file ──────────────────────────────────────────────────────
+// - Generate each rank's local slice of the (never-materialized) global A/B
+//   matrices, in the right dtype and layout for the chosen kernel and TP mode.
+// - Values are a deterministic hash of GLOBAL (batch, row, col) coordinates,
+//   so every rank agrees on any element without storing or communicating it.
+// - Recompute single reference C elements on the CPU (fp16 approximate,
+//   int exact) so --verify-tp can spot-check the distributed GPU result.
+// ──────────────────────────────────────────────────────────────────────────────
 
+#include "src/tp/sharding.h"
 #include <cuda_fp16.h>
 
+// Deterministic hash of (batch, row, col) → small fp16 value in [-0.05, 0.05]; every rank can regenerate any global A/B element without storing the matrix.
 static inline half gen_fp16_val(int batch, int r, int c, int ld) {
     unsigned x = (unsigned)(batch * 1315423911u) ^ (unsigned)(r * 2654435761u)
                ^ (unsigned)(c * 40503u) ^ (unsigned)(ld * 2166136261u);
@@ -12,6 +21,7 @@ static inline half gen_fp16_val(int batch, int r, int c, int ld) {
     return __float2half(v);
 }
 
+// SUMMA (2D mesh), fp16: fills this rank's A [lM×lK] and B [lK×lN] shards for one batch, based on its (row, col) mesh coordinate.
 void fill_rank_batch_shards(
     half* A_shard,
     half* B_shard,
@@ -47,6 +57,7 @@ void fill_rank_batch_shards(
     }
 }
 
+// 1d-col, fp16: fills the full replicated A [M×K] and this rank's B column shard [K×lN].
 void fill_rank_batch_shards_1d_col(
     half* A_full, half* B_shard,
     int M, int N, int K, int local_N,
@@ -63,6 +74,7 @@ void fill_rank_batch_shards_1d_col(
             B_shard[(size_t)k * local_N + n] = gen_fp16_val(batch, k, n_off + n, N);
 }
 
+// 1d-row, fp16: fills this rank's K-slice of A [M×lK] and matching K-rows of B [lK×N].
 void fill_rank_batch_shards_1d_row(
     half* A_shard, half* B_shard,
     int M, int N, int K, int local_K,
@@ -77,6 +89,7 @@ void fill_rank_batch_shards_1d_row(
             B_shard[(size_t)k * N + n] = gen_fp16_val(batch, k_off + k, n, N);
 }
 
+// CPU reference for ONE element of the global fp16 C (full-K dot product); what --verify-tp compares sampled GPU results against.
 float cpu_ref_c_value(int batch, int global_m, int global_n, int K, int N) {
     // Full-K dot product using the same deterministic generator as the shard
     // fill — one global C element, no global matrices materialized.
@@ -88,6 +101,7 @@ float cpu_ref_c_value(int batch, int global_m, int global_n, int K, int N) {
     return acc;
 }
 
+// Same deterministic hash as gen_fp16_val, returned raw for the integer generators below.
 static inline unsigned gen_hash(int batch, int r, int c, int ld) {
     unsigned x = (unsigned)(batch * 1315423911u) ^ (unsigned)(r * 2654435761u)
                ^ (unsigned)(c * 40503u) ^ (unsigned)(ld * 2166136261u);
@@ -97,6 +111,7 @@ static inline unsigned gen_hash(int batch, int r, int c, int ld) {
     return x;
 }
 
+// Hash → small signed integer: [-8,7] for int4, [-7,7] for int8.
 static inline int8_t gen_integer_val(
     int batch, int r, int c, int ld, TpDataKind kind) {
     const unsigned x = gen_hash(batch, r, c, ld);
@@ -105,12 +120,14 @@ static inline int8_t gen_integer_val(
     return static_cast<int8_t>((x % 15u) - 7);
 }
 
+// Packs two int4 values into one byte (lo nibble first) — the storage format the int4 kernels expect.
 static inline int8_t pack_int4(int8_t lo, int8_t hi) {
     const uint8_t packed = (static_cast<uint8_t>(lo) & 0xFu)
                          | ((static_cast<uint8_t>(hi) & 0xFu) << 4);
     return static_cast<int8_t>(packed);
 }
 
+// 1d-col, any data kind: dispatches to fp16 fill or generates int8 / packed-int4 shards (B transposed to N×K, as the int kernels expect).
 void fill_rank_batch_shards_1d_col_typed(
     void* A_full, void* B_shard,
     int M, int N, int K, int local_N,
@@ -155,6 +172,7 @@ void fill_rank_batch_shards_1d_col_typed(
     }
 }
 
+// 1d-row, any data kind: same dispatch as above for the K-sliced A/B shards.
 void fill_rank_batch_shards_1d_row_typed(
     void* A_shard, void* B_shard,
     int M, int N, int K, int local_K,
@@ -199,6 +217,7 @@ void fill_rank_batch_shards_1d_row_typed(
     }
 }
 
+// CPU reference for ONE element of the global int32 C — exact (integer math), used by --verify-tp for int8/int4 variants.
 int32_t cpu_ref_c_value_int(
     int batch, int global_m, int global_n, int K, int N, TpDataKind kind) {
     int32_t acc = 0;
@@ -210,6 +229,7 @@ int32_t cpu_ref_c_value_int(
 }
 
 
+// SUMMA (2D mesh), any data kind: dispatches to fp16 fill or generates int8 / packed-int4 shards from the rank's mesh coordinate.
 void fill_rank_batch_shards_typed(
     void* A_shard, void* B_shard,
     int M, int N, int K,
