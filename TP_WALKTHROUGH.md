@@ -197,10 +197,170 @@ CPU checks:  64 sampled elements from batch0
 So verification does not materialize the massive global matrix. It checks a few
 full-K reference dots.
 
+## 1D Tensor Parallel Walkthrough
+
+`oned_runner.cu` implements two 1D TP modes:
+
+```text
+1d-col: split B/C by N columns
+1d-row: split A/B by K, then sum partial C
+```
+
+The mesh is flat:
+
+```text
+rank0   rank1   rank2   rank3
+```
+
+For a small 2-rank example, think of the matrices as:
+
+```text
+A = [ A0  A1 ]          B = [ B0 ]
+                            [ B1 ]
+
+C = A @ B = A0 @ B0 + A1 @ B1
+```
+
+That same equation can be distributed in two different ways.
+
+## 1D Column Parallel
+
+Column parallel splits the output columns.
+
+For two ranks:
+
+```text
+B = [ B_col0  B_col1 ]
+C = [ C_col0  C_col1 ]
+```
+
+Rank0 owns:
+
+```text
+A full
+B_col0
+C_col0
+```
+
+Rank1 owns:
+
+```text
+A full
+B_col1
+C_col1
+```
+
+Each rank computes a complete local shard:
+
+```text
+rank0: C_col0 = A @ B_col0
+rank1: C_col1 = A @ B_col1
+```
+
+The math needs no communication before or during GEMM. Communication only
+happens if the code wants to materialize full `C`:
+
+```text
+AllGather C shards -> full C
+```
+
+In real transformer stacks, this gather is often skipped. The next row-parallel
+layer can consume the sharded output directly.
+
+## 1D Row Parallel
+
+Row parallel splits the K dimension.
+
+For two ranks:
+
+```text
+A = [ A0  A1 ]
+B = [ B0 ]
+    [ B1 ]
+```
+
+Rank0 owns:
+
+```text
+A0
+B0
+```
+
+Rank1 owns:
+
+```text
+A1
+B1
+```
+
+Each rank computes a full-size partial output:
+
+```text
+rank0: C_partial0 = A0 @ B0
+rank1: C_partial1 = A1 @ B1
+```
+
+Then NCCL sums the partial outputs:
+
+```text
+AllReduce sum:
+C = C_partial0 + C_partial1
+```
+
+So in 1d-row, the collective is the accumulation step. There is no separate
+`C_accum += C_partial` kernel like SUMMA uses.
+
+## 1D Ping/Pong Buffers
+
+The same double-buffering idea appears in `oned_runner.cu`, but it buffers
+outputs instead of input panels.
+
+SUMMA:
+
+```text
+PING/PONG hold A_panel and B_panel
+comm fills next input panels while GEMM reads current input panels
+```
+
+1D:
+
+```text
+PING/PONG hold C output chunks
+compute writes GEMM output into one buffer
+NCCL communicates a C buffer while compute can use the other buffer
+```
+
+In `oned_runner.cu`:
+
+```text
+compute stream: [GEMM chunk0 -> C_ping] [GEMM chunk1 -> C_pong]
+comm stream:                         [collective C_ping] [collective C_pong]
+```
+
+The events are analogous:
+
+```text
+c_ready:
+  compute stream -> comm stream
+  "GEMM finished writing C buffer. NCCL may read it."
+
+c_free:
+  comm stream -> compute stream
+  "NCCL finished with C buffer. GEMM may overwrite it."
+```
+
+## SUMMA vs 1D In One Sentence
+
+```text
+SUMMA communicates input panels and accumulates local partial C.
+1d-col computes sharded C and optionally allgathers output.
+1d-row computes full partial C and allreduces output.
+```
+
 ## How This Relates To The Kernels
 
 The GEMM kernels are mostly TP-agnostic. They do not know about ranks, NCCL,
-mesh rows, mesh columns, or SUMMA.
+mesh rows, mesh columns, SUMMA, or 1D TP.
 
 The runner gives each kernel:
 
