@@ -224,7 +224,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     // comm stream:    [bcast p0 panels → PING][bcast p1 panels (A01,B10) → PONG]
     // compute stream:                         [ GEMM reads PING: A00·B00       ][ GEMM reads PONG: A01·B10 ]
     //                                          ▲ while this GEMM runs, p1's data is already arriving
-    // where p0/p1 = whose turn it is to share
+    // where p0/p1 selects the mesh column that broadcasts A, and the mesh row that broadcasts B.
     // e.g. p=0 means: in every row, the member sitting at column 0 shares its A; in every column, the member sitting at row 0 shares its B.
     // to be more precise:
     // i.  p=0: sharers are: A = rank00, rank10; B = rank00, rank01
@@ -232,7 +232,7 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     // limited advantage here as we only have 4 GPUs and hence there will be 1 single overlap
     // but with a larger number of GPUs this would be v advantageous
 
-    //without pingpong we would have: bcast -> GEMM -> wait for bcast -> GEMM (serial)
+    // without pingpong we would have: bcast p0 -> GEMM p0 -> bcast p1 -> GEMM p1 (serial)
     DeviceBuffer<uint8_t> d_A_panel_ping((size_t)eff_chunk_B * bytesA_l);
     DeviceBuffer<uint8_t> d_A_panel_pong((size_t)eff_chunk_B * bytesA_l);
     DeviceBuffer<uint8_t> d_B_panel_ping((size_t)eff_chunk_B * bytesB_l);
@@ -464,9 +464,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     fflush(stdout);
 
     // ── 5. VERIFY-TP (untimed, all kernel storage variants) ──────────────────
-    // Re-run chunk 0 through the complete panel-broadcast and accumulation path,
-    // then compare 64 sampled local C elements against full-global-K CPU dots
-    // recomputed from the hash generator (sharding.cu).
+    // Re-run chunk0 (first group of batches) through the complete panel-broadcast and accumulation path,
+    // then compare 64 local C elements from batch0 against full-global-K CPU dot products.
     if (args.verify_tp) {
         nvtxRangePushA("verify-tp");
         run_chunk(0);
@@ -533,8 +532,12 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     }
 
     // ── 6. STATS ──────────────────────────────────────────────────────────────
-    // Allreduce the per-rank times over the world comm → avg across ranks and
-    // max (= critical path, the number that matters for wall time).
+    // Purpose: turns each rank's measured local_ms into reported timing numbers.
+    // avg_rank_ms: average of local_ms across ranks, via AllReduce sum / world_size.
+    // wall_ms: max local_ms across ranks, via AllReduce max.
+    // wall_ms is the number that matters for end-to-end wall time: the slowest rank.
+    // If single-rank: both are just local_ms.
+
     ProfileStats stats{};
     stats.avg_rank_ms = local_ms;
     stats.wall_ms = local_ms;
@@ -545,8 +548,18 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
         float host_sum = 0.f;
         float host_max = 0.f;
         CHECK_CUDA(cudaMemcpyAsync(d_send.get(), &local_ms, sizeof(float), cudaMemcpyHostToDevice, compute_stream));
-        CHECK_NCCL(ncclAllReduce((const void*)d_send.get(), (void*)d_sum.get(), 1,
-                                 ncclFloat, ncclSum, world_comm, compute_stream));
+        // ALL RANKS CALL ncclAllReduce COLLECTIVELY!!!
+        // "collectively" is better word than "parallel" here as 
+        // all ranks participate in one coordinated operation and all receive the same reduced result
+        CHECK_NCCL(ncclAllReduce(
+            (const void*)d_send.get(),  // input buffer on this rank: contains this rank's local_ms
+            (void*)d_sum.get(),         // output buffer on this rank: receives sum of all ranks' local_ms
+            1,                          // number of elements to reduce
+            ncclFloat,                  // element type: float
+            ncclSum,                    // reduction operation: sum
+            world_comm,                 // NCCL communicator containing all ranks
+            compute_stream));           // CUDA stream where the collective is enqueued
+            
         CHECK_NCCL(ncclAllReduce((const void*)d_send.get(), (void*)d_max.get(), 1,
                                  ncclFloat, ncclMax, world_comm, compute_stream));
         CHECK_CUDA(cudaMemcpyAsync(&host_sum, d_sum.get(), sizeof(float), cudaMemcpyDeviceToHost, compute_stream));
