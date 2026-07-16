@@ -4,6 +4,7 @@
 #include <cmath>
 #include <random>
 
+// generate full A&B matrices only for hte single-GPU path. For TP runs the inputs come from sharding.cu
 void generate_fp16(half* h_A, half* h_B, int M, int N, int K, int num_batches) {
 	std::mt19937 rng(42);
 	std::uniform_real_distribution<float> dist(-0.05f, 0.05f);

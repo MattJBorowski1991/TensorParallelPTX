@@ -2,6 +2,13 @@
 // SUMMA path (summa_runner.cu). Same kernels, same NCCL bootstrap, different
 // distribution. Flat mesh: --tp-rows 1 --tp-cols P.
 //
+// TLDR:
+// Every rank runs a normal local GEMM. The difference is how A/B/C are sharded:
+//   - 1d-col: split output columns, then optionally allgather C.
+//   - 1d-row: split the K dimension, then allreduce partial C.
+// No input-panel broadcasts happen here. Unlike SUMMA, communication is on the
+// output C buffer, not on A/B panels.
+//
 //   1d-col (column-parallel):  C[:, j] = A · B[:, j]
 //     A replicated, B split by N columns. Each rank's GEMM produces its own
 //     C column shard [M x N/P] — the math needs NO communication.
@@ -13,9 +20,10 @@
 //     full-size PARTIAL C [M x N]; ncclAllReduce sums the partials — the
 //     collective IS the accumulation (contrast with SUMMA's accumulate kernel).
 //
-// Comm/compute overlap: C is double-buffered. The collective for chunk c runs
-// on comm_stream while the GEMM for chunk c+1 runs on compute_stream. Events
-// hand each buffer back and forth: c_ready (compute→comm, GEMM wrote it) and
+// 1d-row: Comm/compute overlap: C (output) is double-buffered. 
+// Ping-pong allows for one partial result to be accumulated (comm_stream, chunk c) while
+// the next partial result is being GEMMed (compute_stream, chunk c+1)
+// Events hand each buffer back and forth: c_ready (compute→comm, GEMM wrote it) and
 // c_free (comm→compute, collective is done with it).
 
 #include "src/tp/oned_runner.h"
@@ -49,7 +57,7 @@ static TpDataKind selected_data_kind() {
 static size_t input_storage_bytes(size_t logical_elements, TpDataKind kind) {
     if (kind == TpDataKind::Fp16) return logical_elements * sizeof(half);
     if (kind == TpDataKind::Int8) return logical_elements * sizeof(int8_t);
-    return logical_elements / 2; // packed signed INT4
+    return logical_elements / 2; // packed signed INT4 - SHOULDNT HERE BE logical_elements * sizeof(int8_t) / 2 ??????
 }
 
 static bool validate_runtime_1d(const Args& args, int num_gpus, TpDataKind kind) {
@@ -89,6 +97,10 @@ static bool validate_runtime_1d(const Args& args, int num_gpus, TpDataKind kind)
     return true;
 }
 
+// run_profile_1d runs once per rank/process. With torchrun --nproc_per_node=4
+// and --tp-cols 4, this function executes 4 times in parallel, once per GPU.
+// Each rank sees the same global M/N/K, but picks a different local shard by
+// using `rank` as its 1D partition index.
 ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     const int P = args.tp_cols;
     const bool col_mode = (args.tp_mode == TpMode::OneDCol);
@@ -97,13 +109,23 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     const TpDataKind data_kind = selected_data_kind();
     const bool integer_output = data_kind != TpDataKind::Fp16;
 
-    // Per-rank GEMM dims per mode (see header comment).
+    // Per-rank GEMM dims:
+    //
+    // 1d-col:
+    //   A is replicated:    [M x K]
+    //   B is column shard:  [K x N/P]
+    //   C is column shard:  [M x N/P]
+    //
+    // 1d-row:
+    //   A is K shard:       [M x K/P]
+    //   B is K-row shard:   [K/P x N]
+    //   C is full partial:  [M x N], then AllReduce sums all ranks' partials.
     const int local_M = M;
     const int local_N = col_mode ? N / P : N;
     const int local_K = col_mode ? K : K / P;
 
-    if (!validate_runtime_1d(args, query_num_gpus(), data_kind)) return {};
-    const int chunk_B = args.chunk_batches > 0 ? args.chunk_batches : 1;
+    if (!validate_runtime_1d(args, query_num_gpus(), data_kind)) return {}; //what is query_num_gpus????
+    const int chunk_B = args.chunk_batches > 0 ? args.chunk_batches : 1; // WHAT IS THE PURPOSE OF THIS CHUNK_B HERE???
     if (chunk_B > B) {
         fprintf(stderr, "[warn] chunk-batches (%d) > B (%d), clamping to B.\n", chunk_B, B);
     }
@@ -119,8 +141,13 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
 
     const int rank = dist.rank;
     const int device = dist.local_rank;
-    CHECK_CUDA(cudaSetDevice(device));
+    CHECK_CUDA(cudaSetDevice(device)); //WHAT DOES THIS DO?
 
+    // -- 1. SETUP -------------------------------------------------------------
+    // 1D TP only needs one NCCL communicator: the flat world of P ranks.
+    // It is used for output collectives:
+    //   - 1d-col: AllGather C shards if we want full C materialized.
+    //   - 1d-row: AllReduce partial C values to form final C.
 #ifdef USE_NCCL
     ncclComm_t world_comm = nullptr;
     if (P > 1) {
@@ -135,6 +162,14 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     }
 #endif
 
+    // Allocate my local A/B shards for every batch, plus two C output buffers.
+    //
+    // Important contrast with SUMMA:
+    //   SUMMA ping/pong buffers hold incoming A/B input panels.
+    //   1D ping/pong buffers hold outgoing C chunks.
+    //
+    // Why output ping/pong? While NCCL communicates C_ping from chunk c, the
+    // compute stream can write the next chunk into C_pong.
     PinnedBuffer<uint8_t> h_A_stage((size_t)B * bytesA_l);
     PinnedBuffer<uint8_t> h_B_stage((size_t)B * bytesB_l);
     DeviceBuffer<uint8_t> d_A((size_t)B * bytesA_l);
@@ -150,6 +185,9 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
     CHECK_CUDA(cudaStreamCreate(&compute_stream));
     CHECK_CUDA(cudaStreamCreate(&comm_stream));
 
+    // Two streams plus a two-way event handshake:
+    //   c_ready: compute -> comm, "GEMM finished writing C; NCCL may read."
+    //   c_free:  comm -> compute, "NCCL finished with C; GEMM may overwrite."
     cudaEvent_t ev_start{}, ev_stop{};
     cudaEvent_t ev_c_ready[2] = {};  // compute→comm: GEMM finished writing C[b]
     cudaEvent_t ev_c_free[2]  = {};  // comm→compute: collective done with C[b]
@@ -160,6 +198,18 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
         CHECK_CUDA(cudaEventCreate(&ev_c_free[b]));
     }
 
+    // -- 2. DATA --------------------------------------------------------------
+    // Generate only this rank's local inputs, then upload them once before the
+    // timed loop. The global A/B matrices are never materialized.
+    //
+    // 1d-col example with P=4:
+    //   rank0 gets B columns 0..N/4-1 and a full copy of A.
+    //   rank1 gets B columns N/4..N/2-1 and a full copy of A.
+    //
+    // 1d-row example with P=4:
+    //   rank0 gets K slice 0 of A/B.
+    //   rank1 gets K slice 1 of A/B.
+    //   each rank later produces a full-size partial C.
     for (int b = 0; b < B; ++b) {
         void* A_dst = h_A_stage.get() + (size_t)b * bytesA_l;
         void* B_dst = h_B_stage.get() + (size_t)b * bytesB_l;
@@ -178,8 +228,17 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
                                (size_t)B * bytesB_l, cudaMemcpyHostToDevice, compute_stream));
     CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
+    // -- 3. run_chunk ---------------------------------------------------------
     // One chunk = GEMM into C[buf] + collective on C[buf]. `pass` alternates
     // buffers across the whole run (chunks AND profile iterations).
+    //
+    // Output ping/pong mental model:
+    //   compute stream: [GEMM chunk0 -> C_ping] [GEMM chunk1 -> C_pong]
+    //   comm stream:                            [NCCL on C_ping       ] [NCCL on C_pong]
+    //
+    // The handshake:
+    //   c_ready: compute -> comm, "GEMM finished writing; NCCL may read."
+    //   c_free:  comm -> compute, "NCCL finished; GEMM may overwrite."
     int pass = 0;
     auto run_chunk = [&](int chunk_idx) {
         char nvtx_name[64];
@@ -206,6 +265,8 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
         float* C_out = (buf == 0) ? d_C_ping.get() : d_C_pong.get();
 
         // Wait until the collective from two chunks ago released this buffer.
+        // Without this, GEMM could overwrite C_ping while NCCL is still reading
+        // C_ping from an earlier chunk.
         // (No memset: the kernel overwrites every element of its C region.)
         CHECK_CUDA(cudaStreamWaitEvent(compute_stream, ev_c_free[buf], 0));
 
@@ -214,13 +275,18 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
                       reinterpret_cast<const half*>(B_own),
                       C_out, cfg, compute_stream);
         nvtxRangePop();
+        // Signal the comm stream: C_out now contains a complete GEMM result.
         CHECK_CUDA(cudaEventRecord(ev_c_ready[buf], compute_stream));
 
 #ifdef USE_NCCL
         if (P > 1) {
+            // NCCL must not read C_out until the GEMM above has finished.
             CHECK_CUDA(cudaStreamWaitEvent(comm_stream, ev_c_ready[buf], 0));
             if (col_mode) {
                 nvtxRangePushA("allgather C");
+                // 1d-col: every rank owns different C columns. AllGather packs
+                // all ranks' C shards into d_C_gathered so full C exists.
+                // The local math itself did not need this collective.
                 CHECK_NCCL(ncclAllGather((const void*)C_out,
                                          (void*)d_C_gathered.get(),
                                          c_chunk_elems, integer_output ? ncclInt32 : ncclFloat,
@@ -228,17 +294,22 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
             } else {
                 nvtxRangePushA("allreduce C");
                 // In-place: sums the P partial C's; the collective IS the accumulation.
+                // After this call, each rank's C_out contains the same final C
+                // for this chunk.
                 CHECK_NCCL(ncclAllReduce((const void*)C_out, (void*)C_out,
                                          c_chunk_elems, integer_output ? ncclInt32 : ncclFloat, ncclSum,
                                          world_comm, comm_stream));
             }
             nvtxRangePop();
+            // Signal the compute stream: this C buffer is safe to reuse.
             CHECK_CUDA(cudaEventRecord(ev_c_free[buf], comm_stream));
         }
 #endif
         nvtxRangePop(); // chunk
     };
 
+    // -- 4. TIMED LOOP --------------------------------------------------------
+    // profile_runs x chunks x run_chunk(), bracketed by cuda events -> ms.
     CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
 
     for (int iter = 0; iter < args.profile_runs; ++iter)
@@ -263,6 +334,9 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
 
     // ── TP correctness check (untimed, all kernel storage variants) ──────────
     // 1d-col checks the local C shard; 1d-row checks C after allreduce.
+    // Re-runs chunk0 through the same GEMM + output collective path.
+    // 1d-col samples global columns owned by this rank.
+    // 1d-row samples C after AllReduce, so it should match full global C.
     if (args.verify_tp) {
         nvtxRangePushA("verify-tp");
         const int vbuf = pass & 1;   // buffer run_chunk(0) will use next
@@ -326,6 +400,12 @@ ProfileStats run_profile_1d(const Args& args, const DistContext& dist) {
         nvtxRangePop();
     }
 
+    // -- 6. STATS -------------------------------------------------------------
+    // Purpose: turns each rank's measured local_ms into reported timing numbers.
+    // avg_rank_ms: average of local_ms across ranks, via AllReduce sum / world_size.
+    // wall_ms: max local_ms across ranks, via AllReduce max.
+    // wall_ms is the number that matters for end-to-end wall time: the slowest rank.
+    // If single-rank: both are just local_ms.
     ProfileStats stats{};
     stats.avg_rank_ms = local_ms;
     stats.wall_ms = local_ms;

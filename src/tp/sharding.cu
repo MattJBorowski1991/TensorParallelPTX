@@ -1,5 +1,5 @@
 // ── Purpose of this file ──────────────────────────────────────────────────────
-// - Generate each rank's local slice of the (never-materialized) global A/B
+// - Generate each rank's full shard of the (never-materialized) global A/B
 //   matrices, in the right dtype and layout for the chosen kernel and TP mode.
 // - Values are a deterministic hash of GLOBAL (batch, row, col) coordinates,
 //   so every rank agrees on any element without storing or communicating it.

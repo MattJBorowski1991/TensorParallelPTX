@@ -222,8 +222,8 @@ ProfileStats run_profile(const Args& args, const DistContext& dist) {
     // PINGPONG (double buffering):
     // overlapping comm with compute
     // comm stream:    [bcast p0 panels → PING][bcast p1 panels (A01,B10) → PONG]
-    // compute stream:                         [ GEMM reads PING: A00·B00       ][ GEMM reads PONG: A01·B10 ]
-    //                                          ▲ while this GEMM runs, p1's data is already arriving
+    // compute stream:                         [ GEMM p0 reads PING: A00·B00       ][ GEMM reads PONG: A01·B10 ]
+    //                                          ▲ while GEMM p0 runs, p1's data is already arriving
     // where p0/p1 selects the mesh column that broadcasts A, and the mesh row that broadcasts B.
     // e.g. p=0 means: in every row, the member sitting at column 0 shares its A; in every column, the member sitting at row 0 shares its B.
     // to be more precise:
